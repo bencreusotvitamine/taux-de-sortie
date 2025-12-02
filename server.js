@@ -9,7 +9,7 @@ import { initDb, db } from "./db.js";
 dotenv.config();
 
 // ---------------------------------------------------------------------
-// 🗄️ Sécurité : s'assure que la DB possède les colonnes nécessaires
+// 🗄️ DB : s'assurer que les colonnes existent
 // ---------------------------------------------------------------------
 
 async function ensureSchema() {
@@ -70,27 +70,34 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function shopifyGet(pathUrl, params = {}, retry = 0) {
+// Renvoie la réponse complète (data + headers)
+async function shopifyGetRaw(pathUrl, params = {}, retry = 0) {
   const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/${pathUrl}`;
-  console.log("➡️ Shopify GET :", url, params);
+  console.log("➡️ Shopify GET (raw) :", url, params);
 
   try {
     const res = await axios.get(url, {
       headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
       params,
     });
-    return res.data;
+    return res;
   } catch (err) {
     const status = err?.response?.status;
     if (status === 429 && retry < 5) {
       const retryAfter = Number(err.response.headers["retry-after"] || 2);
       console.log(`⚠️ 429 Too Many Requests → Attente ${retryAfter}s`);
       await sleep(retryAfter * 1000 + 300);
-      return shopifyGet(pathUrl, params, retry + 1);
+      return shopifyGetRaw(pathUrl, params, retry + 1);
     }
-    console.error("❌ Shopify error", status, err.response?.data || err.message);
+    console.error("❌ Shopify error (raw)", status, err.response?.data || err.message);
     throw err;
   }
+}
+
+// Version simple (seulement data) pour les autres appels
+async function shopifyGet(pathUrl, params = {}, retry = 0) {
+  const res = await shopifyGetRaw(pathUrl, params, retry);
+  return res.data;
 }
 
 function chunkArray(arr, size) {
@@ -102,23 +109,32 @@ function chunkArray(arr, size) {
 }
 
 // ---------------------------------------------------------------------
-// 📥 Nouvelle fonction : récupère TOUS les produits d'une balise
+// 📥 Récupère TOUS les produits avec une balise EXACTE (pagination page_info)
 // ---------------------------------------------------------------------
 
 async function fetchProductsByTag(tag) {
   const tagLower = tag.toLowerCase();
   let results = [];
-  let sinceId = 0;
+  let pageInfo = null;
 
   while (true) {
-    const params = {
-      limit: 250,
-      fields: "id,title,tags,variants,images",
-    };
-    if (sinceId) params.since_id = sinceId;
+    // 1ère page : on peut mettre fields
+    // Pages suivantes : seulement limit + page_info (doc Shopify) :contentReference[oaicite:1]{index=1}
+    let params;
+    if (!pageInfo) {
+      params = {
+        limit: 250,
+        fields: "id,title,tags,variants,images",
+      };
+    } else {
+      params = {
+        limit: 250,
+        page_info: pageInfo,
+      };
+    }
 
-    const data = await shopifyGet("products.json", params);
-    const products = data.products || [];
+    const res = await shopifyGetRaw("products.json", params);
+    const products = res.data.products || [];
 
     if (!products.length) break;
 
@@ -129,11 +145,25 @@ async function fetchProductsByTag(tag) {
         .split(",")
         .map((t) => t.trim().toLowerCase());
 
-      if (tags.includes(tagLower)) results.push(p);
+      // 👉 ICI : balise EXACTE, pas "contient"
+      if (tags.includes(tagLower)) {
+        results.push(p);
+      }
     }
 
-    sinceId = products[products.length - 1].id;
-    if (products.length < 250) break;
+    // Pagination via header Link
+    const linkHeader = res.headers["link"] || res.headers["Link"];
+    if (!linkHeader || !linkHeader.includes('rel="next"')) {
+      break; // plus de page suivante
+    }
+
+    // On extrait le page_info de l'URL next
+    const match = linkHeader.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/);
+    if (!match) {
+      break;
+    }
+
+    pageInfo = match[1];
   }
 
   console.log(`📦 fetchProductsByTag('${tag}') → ${results.length} produits`);
@@ -141,7 +171,7 @@ async function fetchProductsByTag(tag) {
 }
 
 // ---------------------------------------------------------------------
-// 📸 SNAPSHOT STOCK INITIAL (avec pagination complète)
+// 📸 SNAPSHOT STOCK INITIAL (utilise fetchProductsByTag)
 // ---------------------------------------------------------------------
 
 app.post("/api/initial_stock/snapshot", async (req, res) => {
@@ -150,13 +180,14 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
     if (!season) return res.status(400).json({ error: "season required" });
 
     const tag = season.trim();
+    console.log("📌 Snapshot pour la balise (exacte) :", tag);
 
-    console.log("📌 Snapshot pour la balise :", tag);
-
-    // 1) Récupérer tous les produits associés à la balise
+    // 1) Tous les produits (toutes les pages) avec cette balise
     const taggedProducts = await fetchProductsByTag(tag);
 
-    console.log(`📦 ${taggedProducts.length} produits taggués '${tag}'`);
+    console.log(
+      `📦 ${taggedProducts.length} produits avec la balise exacte '${tag}'`
+    );
 
     // 2) Préparation des variantes
     const variantMeta = [];
@@ -174,8 +205,9 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
           image,
         });
 
-        if (v.inventory_item_id)
+        if (v.inventory_item_id) {
           inventoryItemIdsSet.add(v.inventory_item_id);
+        }
       }
     }
 
@@ -273,7 +305,7 @@ app.post("/api/initial_stock/import", async (req, res) => {
       )
     );
 
-    res.json({ success: true });
+    res.json({ success: true, inserted: items.length });
   } catch (e) {
     console.error("❌ import error", e);
     res.status(500).json({ error: "import failed" });
@@ -335,7 +367,7 @@ app.post("/webhooks/inventory_levels_update", async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     console.error("❌ inventory webhook error", e);
-    res.status(500).json({ error: "webhook failed" });
+    res.status(500).json({ error: "inventory webhook failed" });
   }
 });
 
