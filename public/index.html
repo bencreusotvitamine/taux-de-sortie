@@ -29,6 +29,12 @@
       box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
       margin-bottom: 16px;
     }
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 10px;
+      color: #111827;
+    }
     .controls {
       display: flex;
       flex-wrap: wrap;
@@ -77,6 +83,10 @@
       background: #e5e7eb;
       color: #111827;
     }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
     #status {
       font-size: 13px;
       color: #4b5563;
@@ -96,9 +106,9 @@
       gap: 6px;
       padding: 4px 8px;
       border-radius: 999px;
+      font-size: 12px;
       background: #fef2f2;
       color: #b91c1c;
-      font-size: 12px;
     }
     .pill-dot {
       width: 8px;
@@ -106,107 +116,150 @@
       border-radius: 999px;
       background: #dc2626;
     }
+    .pill-secondary {
+      font-size: 12px;
+      color: #6b7280;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
       font-size: 13px;
     }
+    thead {
+      background: #f9fafb;
+    }
     th, td {
-      border-bottom: 1px solid #e5e7eb;
       padding: 8px 10px;
+      border-bottom: 1px solid #e5e7eb;
       text-align: left;
+      vertical-align: middle;
     }
     th {
       font-weight: 600;
+      color: #374151;
       font-size: 11px;
       text-transform: uppercase;
-      background: #f9fafb;
-      color: #374151;
+      letter-spacing: 0.03em;
+    }
+    tr:last-child td {
+      border-bottom: none;
     }
     .prod-cell {
       display: flex;
-      gap: 10px;
       align-items: center;
+      gap: 10px;
     }
     .prod-img {
       width: 44px;
       height: 44px;
       border-radius: 8px;
       object-fit: cover;
-      background: #ccc;
+      background: #e5e7eb;
+      flex-shrink: 0;
     }
     .prod-text-main {
-      font-weight: 600;
       font-size: 13px;
+      font-weight: 500;
+      color: #111827;
       display: flex;
-      gap: 6px;
       align-items: center;
+      gap: 6px;
     }
-    .alert-tag {
-      background: #fee2e2;
-      padding: 2px 6px;
-      border-radius: 999px;
-      font-size: 11px;
-      color: #b91c1c;
+    .prod-text-sub {
+      font-size: 12px;
+      color: #6b7280;
     }
     .chip {
-      background: #eef2ff;
-      color: #3730a3;
+      display: inline-flex;
+      align-items: center;
       padding: 2px 8px;
       border-radius: 999px;
       font-size: 11px;
+      background: #eef2ff;
+      color: #3730a3;
+      font-weight: 500;
     }
-    .pct-cell { font-weight: 600; }
-    .pct-high { color: #16a34a; }
-    .pct-mid  { color: #f97316; }
-    .pct-low  { color: #dc2626; }
-    .row-low  { background: #fef2f2; }
+    .pct-cell {
+      font-weight: 600;
+    }
+    .pct-high {
+      color: #16a34a;
+    }
+    .pct-mid {
+      color: #f97316;
+    }
+    .pct-low {
+      color: #dc2626;
+    }
+    .row-low {
+      background: #fef2f2;
+    }
+    .row-low:hover {
+      background: #fee2e2;
+    }
+    .alert-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: #b91c1c;
+      background: #fee2e2;
+      border-radius: 999px;
+      padding: 2px 6px;
+      margin-left: 4px;
+    }
     .empty {
       text-align: center;
-      color: #9ca3af;
       padding: 20px;
+      color: #9ca3af;
+      font-size: 13px;
+    }
+    @media (max-width: 900px) {
+      body { padding: 12px; }
+      table { font-size: 12px; }
+      th, td { padding: 6px 6px; }
+      .controls { align-items: flex-start; }
     }
   </style>
 </head>
-
 <body>
   <h1>TAUX DE SORTIE</h1>
-  <div class="subtitle">Suivi saison (balises Shopify) avec réassorts, ventes, alertes & taux global.</div>
+  <div class="subtitle">
+    Suivi saison par saison (balises Shopify) avec réassorts, ventes, alertes, taux global et Top 10 meilleures sorties.
+  </div>
 
+  <!-- 🔧 CONTROLES -->
   <div class="card">
     <div class="controls">
       <label>
         Saison / Balises Shopify
-        <input id="season" type="text" placeholder="Ex : ADIDAS, HOMME" />
+        <input id="season" type="text" placeholder="Ex : FW25, HOMME" />
       </label>
-
       <label>
         Seuil stock alertes
         <input id="minStockAlert" type="number" value="10" min="0" />
       </label>
-
       <button id="snapshotBtn">📸 Définir le stock de départ</button>
-      <button id="refreshBtn" class="secondary">🔄 Rafraîchir</button>
-
+      <button id="refreshBtn" class="secondary">🔄 Rafraîchir les données</button>
       <label class="inline-label">
         <input type="checkbox" id="onlyAlerts" />
-        <span>Alerte uniquement</span>
+        <span>Afficher seulement les produits en alerte</span>
       </label>
     </div>
-
     <div id="status"></div>
-
     <div id="alertSummary" class="alert-summary" style="display:none;">
       <span class="pill">
         <span class="pill-dot"></span>
         <span id="alertCountText"></span>
       </span>
+      <span class="pill-secondary">
+        Alerte = stock saison ≥ seuil et peu ou pas de ventes (0 vente ou &lt; 20% de taux de sortie).
+      </span>
     </div>
   </div>
 
+  <!-- 📊 TABLEAU PRINCIPAL + TAUX GLOBAL -->
   <div class="card">
-
-    <!-- 🔥 TAUX GLOBAL ICI -->
     <div id="globalStats" style="
       display:flex;
       gap:20px;
@@ -215,9 +268,9 @@
       margin-bottom:15px;
       flex-wrap:wrap;
     ">
-      <div><strong>Stock total :</strong> <span id="globalStock">—</span></div>
-      <div><strong>Vendu :</strong> <span id="globalSold">—</span></div>
-      <div><strong>Taux global :</strong> <span id="globalRate">—</span></div>
+      <div><strong>Stock saison total :</strong> <span id="globalStock">—</span></div>
+      <div><strong>Vendus :</strong> <span id="globalSold">—</span></div>
+      <div><strong>Taux de sortie global :</strong> <span id="globalRate">—</span></div>
     </div>
 
     <table>
@@ -226,173 +279,313 @@
           <th>Produit</th>
           <th>Variante</th>
           <th>Stock base</th>
-          <th>Réassort</th>
-          <th>Total saison</th>
+          <th>Réassort total</th>
+          <th>Stock saison</th>
           <th>Vendu</th>
           <th>Taux</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="7" class="empty">Aucune donnée.</td></tr>
+        <tr><td colspan="7" class="empty">Aucune donnée pour le moment.</td></tr>
       </tbody>
     </table>
-
   </div>
 
-<script>
-  const tbody = document.getElementById("tbody");
-  const seasonInput = document.getElementById("season");
-  const minStockAlertInput = document.getElementById("minStockAlert");
-  const onlyAlertsCheckbox = document.getElementById("onlyAlerts");
-  const globalStockEl = document.getElementById("globalStock");
-  const globalSoldEl = document.getElementById("globalSold");
-  const globalRateEl = document.getElementById("globalRate");
-  const alertSummary = document.getElementById("alertSummary");
-  const alertCountText = document.getElementById("alertCountText");
-  const statusEl = document.getElementById("status");
+  <!-- ⭐ TOP 10 MEILLEURES SORTIES -->
+  <div class="card">
+    <div class="card-title">Top 10 meilleures sorties (sur la sélection)</div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Produit</th>
+          <th>Variante</th>
+          <th>Stock saison</th>
+          <th>Vendu</th>
+          <th>Taux</th>
+        </tr>
+      </thead>
+      <tbody id="tbodyTop10">
+        <tr><td colspan="6" class="empty">Aucune donnée pour le Top 10.</td></tr>
+      </tbody>
+    </table>
+  </div>
 
-  let lastRows = [];
+  <script>
+    const statusEl = document.getElementById("status");
+    const tbody = document.getElementById("tbody");
+    const tbodyTop10 = document.getElementById("tbodyTop10");
+    const seasonInput = document.getElementById("season");
+    const snapshotBtn = document.getElementById("snapshotBtn");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const onlyAlertsCheckbox = document.getElementById("onlyAlerts");
+    const alertSummary = document.getElementById("alertSummary");
+    const alertCountText = document.getElementById("alertCountText");
+    const minStockAlertInput = document.getElementById("minStockAlert");
+    const globalStockEl = document.getElementById("globalStock");
+    const globalSoldEl = document.getElementById("globalSold");
+    const globalRateEl = document.getElementById("globalRate");
 
-  function setStatus(t) { statusEl.textContent = t || ""; }
-  function pctClass(p) {
-    if (p >= 70) return "pct-high";
-    if (p >= 30) return "pct-mid";
-    return "pct-low";
-  }
-  function badgeForPct(p) {
-    if (p >= 70) return "🔥 Forte";
-    if (p >= 30) return "🟠 Moyenne";
-    return "❄️ Faible";
-  }
-  function getMinStockAlert() {
-    const v = parseInt(minStockAlertInput.value, 10);
-    if (isNaN(v)) return 0;
-    return v;
-  }
+    let lastRows = [];
 
-  function isAlert(row) {
-    const base = row.initial_base ?? 0;
-    const extra = row.extra_received ?? 0;
-    const total = base + extra;
-    const sold = row.sold ?? 0;
-    const pct = row.sell_through_pct ?? 0;
-    const min = getMinStockAlert();
-
-    if (total < min) return false;
-    if (sold === 0) return true;
-    if (pct < 20) return true;
-    return false;
-  }
-
-  function renderRows(rows) {
-    lastRows = rows || [];
-
-    // 📌 CALCUL GLOBAL
-    let totalStock = 0, totalSold = 0;
-
-    rows.forEach(r => {
-      totalStock += (r.initial_base ?? 0) + (r.extra_received ?? 0);
-      totalSold += r.sold ?? 0;
-    });
-
-    const globalRate = totalStock > 0 ? (totalSold / totalStock) * 100 : 0;
-
-    globalStockEl.textContent = totalStock;
-    globalSoldEl.textContent = totalSold;
-    globalRateEl.textContent = globalRate.toFixed(1) + " %";
-
-    // 📌 TABLEAU
-    const onlyAlerts = onlyAlertsCheckbox.checked;
-    const data = onlyAlerts ? rows.filter(isAlert) : rows;
-
-    if (!data.length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty">Aucune donnée.</td></tr>';
-      alertSummary.style.display = "none";
-      return;
+    function setStatus(msg) {
+      statusEl.textContent = msg || "";
     }
 
-    tbody.innerHTML = "";
+    function getMinStockAlert() {
+      const v = parseInt(minStockAlertInput.value, 10);
+      if (Number.isNaN(v) || v < 0) return 0;
+      return v;
+    }
 
-    data.forEach(r => {
-      const base = r.initial_base ?? 0;
-      const extra = r.extra_received ?? 0;
-      const total = base + extra;
-      const sold = r.sold ?? 0;
-      const pct = r.sell_through_pct ?? 0;
+    function pctClass(pct) {
+      if (pct == null) return "";
+      if (pct >= 70) return "pct-high";
+      if (pct >= 30) return "pct-mid";
+      return "pct-low";
+    }
 
-      const alert = isAlert(r);
-      const tr = document.createElement("tr");
-      if (alert) tr.classList.add("row-low");
+    function badgeForPct(pct) {
+      if (pct == null) return "";
+      if (pct >= 70) return "🔥 Forte";
+      if (pct >= 30) return "🟠 Moyenne";
+      return "❄️ Faible";
+    }
 
-      tr.innerHTML = `
-        <td>
-          <div class="prod-cell">
-            ${r.image ? `<img src="${r.image}" class="prod-img">` : `<div class="prod-img"></div>`}
-            <div>
-              <div class="prod-text-main">
-                ${r.product_title}
-                ${alert ? '<span class="alert-tag">⚠️ Alerte</span>' : ""}
+    // ⚠️ Règle d'alerte :
+    // - ignore les variantes avec stock saison < seuil
+    // - sinon alerte si 0 vendu ou taux < 20%
+    function isAlert(row) {
+      const base = row.initial_base ?? 0;
+      const extra = row.extra_received ?? 0;
+      const total = row.initial_total ?? (base + extra);
+      const sold = row.sold ?? 0;
+      const pct = row.sell_through_pct ?? 0;
+      const minStock = getMinStockAlert();
+
+      if (total < minStock) return false;
+      if (sold === 0) return true;
+      if (pct < 20) return true;
+      return false;
+    }
+
+    function updateAlertSummary(rows) {
+      const alertRows = rows.filter(isAlert);
+      if (!rows.length || !alertRows.length) {
+        alertSummary.style.display = "none";
+        return;
+      }
+      alertSummary.style.display = "flex";
+      const n = alertRows.length;
+      alertCountText.textContent =
+        n === 1 ? "1 produit en alerte" : n + " produits en alerte";
+    }
+
+    // ⭐ TOP 10
+    function updateTop10(rows) {
+      if (!rows || !rows.length) {
+        tbodyTop10.innerHTML =
+          '<tr><td colspan="6" class="empty">Aucune donnée pour le Top 10.</td></tr>';
+        return;
+      }
+
+      // on ne garde que les variantes avec stock > 0 et ventes > 0
+      const filtered = rows
+        .map(r => {
+          const base = r.initial_base ?? 0;
+          const extra = r.extra_received ?? 0;
+          const total = r.initial_total ?? (base + extra);
+          const sold = r.sold ?? 0;
+          const pct = r.sell_through_pct ?? 0;
+          return { ...r, _total: total, _sold: sold, _pct: pct };
+        })
+        .filter(r => r._total > 0 && r._sold > 0);
+
+      if (!filtered.length) {
+        tbodyTop10.innerHTML =
+          '<tr><td colspan="6" class="empty">Aucune donnée pour le Top 10.</td></tr>';
+        return;
+      }
+
+      // tri décroissant par taux de sortie
+      filtered.sort((a, b) => b._pct - a._pct);
+
+      const top = filtered.slice(0, 10);
+
+      tbodyTop10.innerHTML = "";
+      top.forEach((r, index) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${index + 1}</td>
+          <td>${r.product_title || ""}</td>
+          <td><span class="chip">${r.variant_title || "—"}</span></td>
+          <td>${r._total}</td>
+          <td>${r._sold}</td>
+          <td class="pct-cell ${pctClass(r._pct)}">
+            ${r._pct.toFixed(1)} % — ${badgeForPct(r._pct)}
+          </td>
+        `;
+        tbodyTop10.appendChild(tr);
+      });
+    }
+
+    function renderRows(rows) {
+      lastRows = rows || [];
+
+      // 📊 CALCUL GLOBAL
+      let totalStock = 0;
+      let totalSold = 0;
+
+      rows.forEach((r) => {
+        const base = r.initial_base ?? 0;
+        const extra = r.extra_received ?? 0;
+        const sold = r.sold ?? 0;
+        const seasonStock = r.initial_total ?? (base + extra);
+        totalStock += seasonStock;
+        totalSold += sold;
+      });
+
+      const globalRate = totalStock > 0 ? (totalSold / totalStock) * 100 : 0;
+      globalStockEl.textContent = totalStock;
+      globalSoldEl.textContent = totalSold;
+      globalRateEl.textContent = globalRate.toFixed(1) + " %";
+
+      // 🟦 Rendu tableau principal
+      if (!lastRows.length) {
+        tbody.innerHTML =
+          '<tr><td colspan="7" class="empty">Aucune donnée pour cette sélection.</td></tr>';
+        updateAlertSummary(lastRows);
+        updateTop10(lastRows);
+        return;
+      }
+
+      const onlyAlerts = onlyAlertsCheckbox.checked;
+      const rowsToShow = onlyAlerts ? lastRows.filter(isAlert) : lastRows;
+
+      if (!rowsToShow.length) {
+        tbody.innerHTML =
+          '<tr><td colspan="7" class="empty">Aucun produit ne correspond au filtre actuel.</td></tr>';
+        updateAlertSummary(lastRows);
+        updateTop10(lastRows);
+        return;
+      }
+
+      tbody.innerHTML = "";
+      rowsToShow.forEach((r) => {
+        const tr = document.createElement("tr");
+
+        const img = r.image || "";
+        const productTitle = r.product_title || "";
+        const variantTitle = r.variant_title || "";
+        const base = r.initial_base ?? 0;
+        const extra = r.extra_received ?? 0;
+        const total = r.initial_total ?? (base + extra);
+        const restocks = r.restock_count ?? 0;
+        const sold = r.sold ?? 0;
+        const pct = r.sell_through_pct ?? 0;
+        const alert = isAlert(r);
+
+        if (alert) tr.classList.add("row-low");
+
+        tr.innerHTML = `
+          <td>
+            <div class="prod-cell">
+              ${
+                img
+                  ? `<img src="${img}" alt="" class="prod-img" />`
+                  : `<div class="prod-img"></div>`
+              }
+              <div>
+                <div class="prod-text-main">
+                  ${productTitle}
+                  ${
+                    alert
+                      ? '<span class="alert-tag"><span>⚠️</span><span>Faible sortie</span></span>'
+                      : ""
+                  }
+                </div>
+                <div class="prod-text-sub">
+                  Base : ${base} · Réassort : ${extra} (${restocks} réassort${restocks > 1 ? "s" : ""})
+                </div>
               </div>
             </div>
-          </div>
-        </td>
+          </td>
+          <td><span class="chip">${variantTitle || "—"}</span></td>
+          <td>${base}</td>
+          <td>${extra}</td>
+          <td>${total}</td>
+          <td>${sold}</td>
+          <td class="pct-cell ${pctClass(pct)}">
+            ${pct.toFixed(1)} % — ${badgeForPct(pct)}
+          </td>
+        `;
 
-        <td><span class="chip">${r.variant_title}</span></td>
-        <td>${base}</td>
-        <td>${extra}</td>
-        <td>${total}</td>
-        <td>${sold}</td>
-        <td class="${pctClass(pct)} pct-cell">${pct.toFixed(1)} % — ${badgeForPct(pct)}</td>
-      `;
+        tbody.appendChild(tr);
+      });
 
-      tbody.appendChild(tr);
-    });
-
-    // Résumé alertes
-    const alertCount = rows.filter(isAlert).length;
-    if (alertCount > 0) {
-      alertCountText.textContent = `${alertCount} produit${alertCount > 1 ? "s" : ""} en alerte`;
-      alertSummary.style.display = "flex";
-    } else {
-      alertSummary.style.display = "none";
+      updateAlertSummary(lastRows);
+      updateTop10(lastRows);
     }
-  }
 
-  async function refresh() {
-    const season = seasonInput.value.trim();
-    if (!season) return alert("Saisis une balise");
+    async function doSnapshot() {
+      const season = seasonInput.value.trim();
+      if (!season) {
+        alert("Merci de saisir au moins une balise (ex: FW25, HOMME).");
+        return;
+      }
 
-    setStatus("Chargement…");
+      snapshotBtn.disabled = true;
+      refreshBtn.disabled = true;
+      setStatus("📸 Snapshot du stock de départ en cours…");
 
-    const res = await fetch("/api/sellthrough?season=" + encodeURIComponent(season));
-    const data = await res.json();
-    setStatus("");
-    renderRows(data);
-  }
+      try {
+        const res = await fetch("/api/initial_stock/snapshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ season }),
+        });
 
-  async function snapshot() {
-    const season = seasonInput.value.trim();
-    if (!season) return alert("Saisis une balise");
+        const json = await res.json();
+        if (!res.ok) {
+          console.error(json);
+          setStatus("❌ Erreur snapshot : " + (json.error || "inconnue"));
+        } else {
+          setStatus("✅ Stock de départ mis à jour pour " + season + " (" + json.inserted + " variantes).");
+          await refresh();
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus("❌ Erreur réseau pendant le snapshot.");
+      } finally {
+        snapshotBtn.disabled = false;
+        refreshBtn.disabled = false;
+      }
+    }
 
-    setStatus("Création du snapshot…");
+    async function refresh() {
+      const season = seasonInput.value.trim();
+      if (!season) {
+        setStatus("Saisis une saison / balises puis clique sur Snapshot.");
+        return;
+      }
 
-    const res = await fetch("/api/initial_stock/snapshot", {
-      method: "POST",
-      headers: { "Content-Type":"application/json" },
-      body: JSON.stringify({ season })
-    });
+      setStatus("🔄 Chargement des données…");
 
-    const json = await res.json();
-    setStatus("Snapshot OK. Actualisation…");
-    await refresh();
-  }
+      try {
+        const res = await fetch("/api/sellthrough?season=" + encodeURIComponent(season));
+        const data = await res.json();
+        renderRows(data);
+        setStatus("✅ Données mises à jour (" + data.length + " lignes avant filtre).");
+      } catch (e) {
+        console.error(e);
+        setStatus("❌ Erreur lors du chargement des données.");
+      }
+    }
 
-  document.getElementById("snapshotBtn").onclick = snapshot;
-  document.getElementById("refreshBtn").onclick = refresh;
-  onlyAlertsCheckbox.onchange = () => renderRows(lastRows);
-  minStockAlertInput.onchange = () => renderRows(lastRows);
-
-</script>
-
+    snapshotBtn.addEventListener("click", doSnapshot);
+    refreshBtn.addEventListener("click", refresh);
+    onlyAlertsCheckbox.addEventListener("change", () => renderRows(lastRows));
+    minStockAlertInput.addEventListener("change", () => renderRows(lastRows));
+  </script>
 </body>
 </html>
