@@ -43,7 +43,7 @@
       border-radius: 8px;
       border: 1px solid #d1d5db;
       font-size: 14px;
-      min-width: 120px;
+      min-width: 160px;
     }
     button {
       padding: 8px 14px;
@@ -87,7 +87,7 @@
     th {
       font-weight: 600;
       color: #374151;
-      font-size: 12px;
+      font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.03em;
     }
@@ -163,19 +163,10 @@
       color: #9ca3af;
       font-size: 13px;
     }
-    @media (max-width: 768px) {
-      body {
-        padding: 12px;
-      }
-      .controls {
-        align-items: stretch;
-      }
-      table {
-        font-size: 12px;
-      }
-      th, td {
-        padding: 6px 6px;
-      }
+    @media (max-width: 900px) {
+      body { padding: 12px; }
+      table { font-size: 12px; }
+      th, td { padding: 6px 6px; }
     }
   </style>
 </head>
@@ -185,8 +176,8 @@
   <div class="card">
     <div class="controls">
       <label>
-        Saison / Balise Shopify
-        <input id="season" placeholder="Ex : FW25" />
+        Saison / Balises Shopify
+        <input id="season" placeholder="Ex : FW25, HOMME" />
       </label>
       <button id="snapshotBtn">
         📸 Définir le stock de départ
@@ -204,13 +195,15 @@
         <tr>
           <th>Produit</th>
           <th>Variante</th>
-          <th>Stock départ</th>
+          <th>Stock base</th>
+          <th>Réassort total</th>
+          <th>Stock saison</th>
           <th>Vendu</th>
           <th>Taux de sortie</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="5" class="empty">Aucune donnée pour le moment.</td></tr>
+        <tr><td colspan="7" class="empty">Aucune donnée pour le moment.</td></tr>
       </tbody>
     </table>
   </div>
@@ -246,7 +239,7 @@
 
     function renderRows(rows) {
       if (!rows || !rows.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="empty">Aucune donnée pour cette saison / balise.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="empty">Aucune donnée pour cette sélection.</td></tr>';
         return;
       }
 
@@ -257,7 +250,10 @@
         const img = r.image || "";
         const productTitle = r.product_title || "";
         const variantTitle = r.variant_title || "";
-        const initial = r.initial ?? 0;
+        const base = r.initial_base ?? 0;
+        const extra = r.extra_received ?? 0;
+        const total = r.initial_total ?? (base + extra);
+        const restocks = r.restock_count ?? 0;
         const sold = r.sold ?? 0;
         const pct = r.sell_through_pct ?? 0;
 
@@ -271,14 +267,18 @@
               }
               <div>
                 <div class="prod-text-main">${productTitle}</div>
-                <div class="prod-text-sub">${initial} en stock au départ</div>
+                <div class="prod-text-sub">
+                  Base : ${base} &nbsp;·&nbsp; Réassort : ${extra} (${restocks} réassort${restocks > 1 ? "s" : ""})
+                </div>
               </div>
             </div>
           </td>
           <td>
             <span class="chip">${variantTitle || "—"}</span>
           </td>
-          <td>${initial}</td>
+          <td>${base}</td>
+          <td>${extra}</td>
+          <td>${total}</td>
           <td>${sold}</td>
           <td class="pct-cell ${pctClass(pct)}">
             ${pct.toFixed(1)} %
@@ -293,7 +293,7 @@
     async function doSnapshot() {
       const season = seasonInput.value.trim();
       if (!season) {
-        alert("Merci de saisir une saison / balise (ex: FW25).");
+        alert("Merci de saisir au moins une balise (ex: FW25, HOMME).");
         return;
       }
 
@@ -313,7 +313,7 @@
           console.error(json);
           setStatus("❌ Erreur snapshot : " + (json.error || "inconnue"));
         } else {
-          setStatus("✅ Stock de départ enregistré (" + json.inserted + " lignes).");
+          setStatus("✅ Stock de départ mis à jour pour " + season + " (" + json.inserted + " variantes).");
           await refresh();
         }
       } catch (e) {
@@ -328,7 +328,7 @@
     async function refresh() {
       const season = seasonInput.value.trim();
       if (!season) {
-        setStatus("Saisis une saison / balise puis clique sur Snapshot.");
+        setStatus("Saisis une saison / balises puis clique sur Snapshot.");
         return;
       }
 
