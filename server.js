@@ -16,29 +16,53 @@ const app = express();
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// CONFIG (à remplir dans .env)
-// SHOP_NAME=ta-boutique.myshopify.com
-// ADMIN_API_TOKEN=token_admin_de_ton_app_personnalisee
+/* -------------------------------------------------------------------------- */
+/*                         NORMALISATION DU DOMAINE                           */
+/* -------------------------------------------------------------------------- */
 
-const SHOP_NAME = process.env.SHOP_NAME; // ex: vitamine-club.myshopify.com
+// SHOP_NAME peut être saisi sous plusieurs formes :
+// - vitamine-clubfr
+// - vitamine-clubfr.myshopify.com
+// - https://vitamine-clubfr.myshopify.com
+// - https://vitamine-clubfr.myshopify.com/admin
+
+let RAW_SHOP_NAME = (process.env.SHOP_NAME || "").trim();
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
-const API_VERSION = process.env.API_VERSION || "2024-10"; // ajuste si besoin
+const API_VERSION = process.env.API_VERSION || "2024-10";
 
-if (!SHOP_NAME || !ADMIN_API_TOKEN) {
-  console.warn("⚠️ SHOP_NAME ou ADMIN_API_TOKEN non définis dans .env");
+// Nettoyage automatique
+let SHOP_DOMAIN = RAW_SHOP_NAME
+  .replace(/^https?:\/\//, "")     // supprime "http://"
+  .replace(/\/admin.*$/i, "")      // supprime "/admin/xxxxx"
+  .replace(/\/$/, "");             // supprime "/" final
+
+// Si la personne n'a mis que le nom (ex: "vitamine-clubfr")
+if (!SHOP_DOMAIN.includes(".")) {
+  SHOP_DOMAIN = `${SHOP_DOMAIN}.myshopify.com`;
 }
 
-// --- Utilitaires pour appeler Shopify Admin REST ---
+console.log("📦 SHOP_DOMAIN normalisé =", SHOP_DOMAIN);
+
+/* -------------------------------------------------------------------------- */
+/*                     FONCTION D'APPEL SHOPIFY ADMIN API                     */
+/* -------------------------------------------------------------------------- */
+
 async function shopifyGet(pathUrl, params = {}) {
-  const url = `https://${SHOP_NAME}/admin/api/${API_VERSION}/${pathUrl}`;
+  const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/${pathUrl}`;
+  console.log("➡️ Appel Shopify :", url);
+
   const res = await axios.get(url, {
     headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
     params,
   });
+
   return res.data;
 }
 
-// --- API : snapshot du stock de départ ---
+/* -------------------------------------------------------------------------- */
+/*                         SNAPSHOT STOCK INITIAL                             */
+/* -------------------------------------------------------------------------- */
+
 app.post("/api/initial_stock/snapshot", async (req, res) => {
   try {
     const { season } = req.body;
@@ -52,10 +76,12 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
         const inv = await shopifyGet("inventory_levels.json", {
           inventory_item_ids: v.inventory_item_id,
         });
+
         let qty = 0;
-        if (inv && inv.inventory_levels && inv.inventory_levels.length) {
+        if (inv?.inventory_levels?.length) {
           for (const lvl of inv.inventory_levels) qty += lvl.available;
         }
+
         toInsert.push({
           variant_id: v.id,
           sku: v.sku,
@@ -65,59 +91,69 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
       }
     }
 
-    const insertPromises = toInsert.map((i) =>
-      db.run(
-        `REPLACE INTO initial_stock (variant_id, sku, initial_qty, season, snapshot_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [i.variant_id, i.sku, i.initial_qty, i.season, new Date().toISOString()]
+    // Sauvegarde en DB
+    await Promise.all(
+      toInsert.map((i) =>
+        db.run(
+          `REPLACE INTO initial_stock (variant_id, sku, initial_qty, season, snapshot_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [i.variant_id, i.sku, i.initial_qty, season, new Date().toISOString()]
+        )
       )
     );
-    await Promise.all(insertPromises);
 
     res.json({ success: true, inserted: toInsert.length });
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("❌ snapshot error", err);
     res.status(500).json({ error: "snapshot failed" });
   }
 });
 
-// --- API : Import CSV simple (envoyé en JSON) ---
+/* -------------------------------------------------------------------------- */
+/*                            IMPORT CSV / JSON                               */
+/* -------------------------------------------------------------------------- */
+
 app.post("/api/initial_stock/import", async (req, res) => {
   try {
     const { season, items } = req.body;
     if (!season || !items)
       return res.status(400).json({ error: "season + items required" });
 
-    const insertPromises = items.map((i) =>
-      db.run(
-        `REPLACE INTO initial_stock (variant_id, sku, initial_qty, season, snapshot_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [
-          i.variant_id,
-          i.sku || null,
-          i.initial_qty || 0,
-          season,
-          new Date().toISOString(),
-        ]
+    await Promise.all(
+      items.map((i) =>
+        db.run(
+          `REPLACE INTO initial_stock (variant_id, sku, initial_qty, season, snapshot_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            i.variant_id,
+            i.sku || null,
+            i.initial_qty || 0,
+            season,
+            new Date().toISOString(),
+          ]
+        )
       )
     );
-    await Promise.all(insertPromises);
+
     res.json({ success: true, inserted: items.length });
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("❌ import error", err);
     res.status(500).json({ error: "import failed" });
   }
 });
 
-// --- Webhook: orders/create ---
+/* -------------------------------------------------------------------------- */
+/*                                WEBHOOKS                                   */
+/* -------------------------------------------------------------------------- */
+
+// orders/create
 app.post("/webhooks/orders_create", async (req, res) => {
   try {
     const order = req.body;
-    if (!order || !order.line_items) return res.status(400).end();
+    if (!order?.line_items) return res.status(400).end();
 
-    const ops = [];
-    for (const line of order.line_items) {
-      ops.push(
+    await Promise.all(
+      order.line_items.map((line) =>
         db.run(
           `INSERT INTO sales (variant_id, sku, qty, order_id, created_at)
            VALUES (?, ?, ?, ?, ?)`,
@@ -129,74 +165,84 @@ app.post("/webhooks/orders_create", async (req, res) => {
             order.created_at,
           ]
         )
-      );
-    }
-    await Promise.all(ops);
+      )
+    );
+
     res.json({ success: true });
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("❌ webhook order error", err);
     res.status(500).json({ error: "webhook failed" });
   }
 });
 
-// --- Webhook: inventory_levels/update ---
+// inventory_levels/update
 app.post("/webhooks/inventory_levels_update", async (req, res) => {
   try {
-    const payload = req.body;
+    const p = req.body;
+
     await db.run(
       `INSERT INTO inventory_changes (inventory_item_id, location_id, available, recorded_at)
        VALUES (?, ?, ?, ?)`,
       [
-        payload.inventory_item_id || null,
-        payload.location_id || null,
-        payload.available || 0,
+        p.inventory_item_id || null,
+        p.location_id || null,
+        p.available || 0,
         new Date().toISOString(),
       ]
     );
+
     res.json({ success: true });
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("❌ inventory webhook error", err);
     res.status(500).json({ error: "inventory webhook failed" });
   }
 });
 
-// --- API pour calculer le sell-through ---
+/* -------------------------------------------------------------------------- */
+/*                     CALCUL DU TAUX DE SORTIE / SELL-THROUGH               */
+/* -------------------------------------------------------------------------- */
+
 app.get("/api/sellthrough", async (req, res) => {
   try {
-    const { season, groupBy } = req.query;
-    if (!season) return res.status(400).json({ error: "season param required" });
+    const { season } = req.query;
+    if (!season) return res.status(400).json({ error: "season required" });
 
     const initial = await db.all(
       `SELECT * FROM initial_stock WHERE season = ?`,
       [season]
     );
+
     const sales = await db.all(
-      `SELECT variant_id, SUM(qty) as sold FROM sales GROUP BY variant_id`
+      `SELECT variant_id, SUM(qty) AS sold FROM sales GROUP BY variant_id`
     );
+
     const soldMap = new Map(sales.map((s) => [String(s.variant_id), s.sold]));
 
     const results = initial.map((i) => {
       const sold = soldMap.get(String(i.variant_id)) || 0;
-      const rate = i.initial_qty ? (sold / i.initial_qty) * 100 : null;
+      const pct = i.initial_qty ? (sold / i.initial_qty) * 100 : null;
+
       return {
         variant_id: i.variant_id,
         sku: i.sku,
         initial: i.initial_qty,
         sold,
-        sell_through_pct: rate == null ? null : Number(rate.toFixed(1)),
-        season: i.season,
+        sell_through_pct: pct == null ? null : Number(pct.toFixed(1)),
       };
     });
 
     res.json(results);
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("❌ sellthrough error", err);
     res.status(500).json({ error: "sellthrough failed" });
   }
 });
 
-// --- Démarrage ---
+/* -------------------------------------------------------------------------- */
+/*                                START SERVER                               */
+/* -------------------------------------------------------------------------- */
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log(`App TAUX DE SORTIE démarrée sur port ${PORT}`)
+  console.log(`🚀 App TAUX DE SORTIE démarrée sur port ${PORT}`)
 );
