@@ -32,11 +32,11 @@ const API_VERSION = process.env.API_VERSION || "2024-10";
 
 // Nettoyage automatique
 let SHOP_DOMAIN = RAW_SHOP_NAME
-  .replace(/^https?:\/\//, "")     // supprime "http://"
-  .replace(/\/admin.*$/i, "")      // supprime "/admin/xxxxx"
-  .replace(/\/$/, "");             // supprime "/" final
+  .replace(/^https?:\/\//, "") // supprime "http(s)://"
+  .replace(/\/admin.*$/i, "")  // supprime "/admin/xxxxx"
+  .replace(/\/$/, "");         // supprime "/" final
 
-// Si la personne n'a mis que le nom (ex: "vitamine-clubfr")
+// Si tu as mis juste "vitamine-clubfr"
 if (!SHOP_DOMAIN.includes(".")) {
   SHOP_DOMAIN = `${SHOP_DOMAIN}.myshopify.com`;
 }
@@ -44,54 +44,161 @@ if (!SHOP_DOMAIN.includes(".")) {
 console.log("📦 SHOP_DOMAIN normalisé =", SHOP_DOMAIN);
 
 /* -------------------------------------------------------------------------- */
-/*                     FONCTION D'APPEL SHOPIFY ADMIN API                     */
+/*                FONCTION D'APPEL SHOPIFY AVEC GESTION 429                   */
 /* -------------------------------------------------------------------------- */
 
-async function shopifyGet(pathUrl, params = {}) {
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Appel Shopify avec retry automatique en cas de 429 (rate limit)
+async function shopifyGet(pathUrl, params = {}, retry = 0) {
   const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/${pathUrl}`;
-  console.log("➡️ Appel Shopify :", url);
+  console.log("➡️ Appel Shopify :", url, params);
 
-  const res = await axios.get(url, {
-    headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
-    params,
-  });
+  try {
+    const res = await axios.get(url, {
+      headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
+      params,
+    });
+    return res.data;
+  } catch (err) {
+    const status = err?.response?.status;
 
-  return res.data;
+    if (status === 429 && retry < 5) {
+      // On a dépassé la limite → attendre puis réessayer
+      const retryAfterHeader = err.response.headers["retry-after"];
+      const retryAfterSec = retryAfterHeader
+        ? Number(retryAfterHeader)
+        : 2; // par défaut 2 secondes
+
+      console.warn(
+        `⚠️ Rate limit (429). Pause ${retryAfterSec}s avant retry (tentative ${
+          retry + 1
+        }/5)`
+      );
+
+      await sleep(retryAfterSec * 1000 + 200);
+      return shopifyGet(pathUrl, params, retry + 1);
+    }
+
+    console.error("❌ Shopify error", status, err.response?.data || err.message);
+    throw err;
+  }
 }
 
 /* -------------------------------------------------------------------------- */
-/*                         SNAPSHOT STOCK INITIAL                             */
+/*                                 UTILITAIRE                                 */
 /* -------------------------------------------------------------------------- */
+
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                 SNAPSHOT STOCK INITIAL – FILTRÉ PAR BALISE                 */
+/* -------------------------------------------------------------------------- */
+/*
+  Dans l'interface :
+  - Tu saisis par exemple "FW25" dans le champ "Saison"
+  - Ici, on considère que "FW25" est une BALISE Shopify
+  - On récupère seulement les produits qui ont cette balise
+*/
 
 app.post("/api/initial_stock/snapshot", async (req, res) => {
   try {
     const { season } = req.body;
     if (!season) return res.status(400).json({ error: "season required" });
 
-    const products = await shopifyGet("products.json", { limit: 250 });
+    // On utilise la saison comme NOM DE BALISE Shopify
+    const tag = season.trim();
+    const tagLower = tag.toLowerCase();
 
-    const toInsert = [];
-    for (const p of products.products) {
+    // 1) Récupérer jusqu'à 250 produits (on peut élargir plus tard avec la pagination)
+    const productsData = await shopifyGet("products.json", { limit: 250 });
+    const allProducts = productsData.products || [];
+
+    // 2) Garder seulement ceux qui ont la balise saisie (FW25, SS25, etc.)
+    const taggedProducts = allProducts.filter((p) => {
+      if (!p.tags) return false;
+      return p.tags
+        .split(",")
+        .map((t) => t.trim().toLowerCase())
+        .includes(tagLower);
+    });
+
+    console.log(
+      `📦 ${allProducts.length} produits au total, ${taggedProducts.length} produits avec la balise '${tag}'`
+    );
+
+    // 3) Récupérer les variantes + inventory_item_ids pour ces produits filtrés
+    const variants = [];
+    const inventoryItemIdsSet = new Set();
+
+    for (const p of taggedProducts) {
+      if (!p.variants) continue;
       for (const v of p.variants) {
-        const inv = await shopifyGet("inventory_levels.json", {
-          inventory_item_ids: v.inventory_item_id,
-        });
-
-        let qty = 0;
-        if (inv?.inventory_levels?.length) {
-          for (const lvl of inv.inventory_levels) qty += lvl.available;
+        variants.push(v);
+        if (v.inventory_item_id) {
+          inventoryItemIdsSet.add(v.inventory_item_id);
         }
-
-        toInsert.push({
-          variant_id: v.id,
-          sku: v.sku,
-          initial_qty: qty,
-          season,
-        });
       }
     }
 
-    // Sauvegarde en DB
+    const inventoryItemIds = Array.from(inventoryItemIdsSet);
+    console.log(
+      `🧮 ${variants.length} variantes, ${inventoryItemIds.length} inventory_item_ids uniques pour la balise '${tag}'`
+    );
+
+    // 4) Appeler inventory_levels en paquets pour respecter la limite API
+    const chunkSize = 40;
+    const idChunks = chunkArray(inventoryItemIds, chunkSize);
+    const inventoryMap = new Map(); // inventory_item_id -> quantité totale
+
+    for (let index = 0; index < idChunks.length; index++) {
+      const idsChunk = idChunks[index];
+      console.log(
+        `📡 Chunk ${index + 1}/${idChunks.length} - ${idsChunk.length} IDs`
+      );
+
+      const invData = await shopifyGet("inventory_levels.json", {
+        inventory_item_ids: idsChunk.join(","),
+        limit: 250,
+      });
+
+      const levels = invData.inventory_levels || [];
+      for (const lvl of levels) {
+        const id = lvl.inventory_item_id;
+        const current = inventoryMap.get(id) || 0;
+        inventoryMap.set(id, current + (lvl.available ?? 0));
+      }
+
+      // Petite pause entre les paquets pour être encore plus safe
+      if (index + 1 < idChunks.length) {
+        await sleep(600); // 0,6 s
+      }
+    }
+
+    console.log(
+      `📊 Inventaire récupéré pour ${inventoryMap.size} inventory_item_ids`
+    );
+
+    // 5) Construire les lignes à insérer
+    const toInsert = variants.map((v) => {
+      const qty = inventoryMap.get(v.inventory_item_id) || 0;
+      return {
+        variant_id: v.id,
+        sku: v.sku,
+        initial_qty: qty,
+        season, // on garde "FW25" comme saison pour tes filtres
+      };
+    });
+
+    // 6) Sauvegarder en DB
     await Promise.all(
       toInsert.map((i) =>
         db.run(
@@ -102,6 +209,7 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
       )
     );
 
+    console.log(`✅ Snapshot terminé. Lignes insérées : ${toInsert.length}`);
     res.json({ success: true, inserted: toInsert.length });
   } catch (err) {
     console.error("❌ snapshot error", err);
