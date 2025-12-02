@@ -94,7 +94,7 @@ async function shopifyGetRaw(pathUrl, params = {}, retry = 0) {
   }
 }
 
-// Version simple (seulement data) pour les autres appels
+// Version simple (seulement data)
 async function shopifyGet(pathUrl, params = {}, retry = 0) {
   const res = await shopifyGetRaw(pathUrl, params, retry);
   return res.data;
@@ -109,17 +109,23 @@ function chunkArray(arr, size) {
 }
 
 // ---------------------------------------------------------------------
-// 📥 Récupère TOUS les produits avec une balise EXACTE (pagination page_info)
+// 📥 Récupère TOUS les produits qui ont TOUTES les balises demandées
 // ---------------------------------------------------------------------
 
-async function fetchProductsByTag(tag) {
-  const tagLower = tag.toLowerCase();
+async function fetchProductsByTags(tagsArray) {
+  const requiredTags = tagsArray
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!requiredTags.length) {
+    console.log("⚠️ fetchProductsByTags appelé sans tags utiles");
+    return [];
+  }
+
   let results = [];
   let pageInfo = null;
 
   while (true) {
-    // 1ère page : on peut mettre fields
-    // Pages suivantes : seulement limit + page_info (doc Shopify) :contentReference[oaicite:1]{index=1}
     let params;
     if (!pageInfo) {
       params = {
@@ -145,33 +151,31 @@ async function fetchProductsByTag(tag) {
         .split(",")
         .map((t) => t.trim().toLowerCase());
 
-      // 👉 ICI : balise EXACTE, pas "contient"
-      if (tags.includes(tagLower)) {
+      // 👉 On ne retient le produit que si TOUTES les balises demandées sont présentes
+      const hasAll = requiredTags.every((rt) => tags.includes(rt));
+      if (hasAll) {
         results.push(p);
       }
     }
 
-    // Pagination via header Link
     const linkHeader = res.headers["link"] || res.headers["Link"];
     if (!linkHeader || !linkHeader.includes('rel="next"')) {
-      break; // plus de page suivante
-    }
-
-    // On extrait le page_info de l'URL next
-    const match = linkHeader.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/);
-    if (!match) {
       break;
     }
 
+    const match = linkHeader.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/);
+    if (!match) break;
     pageInfo = match[1];
   }
 
-  console.log(`📦 fetchProductsByTag('${tag}') → ${results.length} produits`);
+  console.log(
+    `📦 fetchProductsByTags(${requiredTags.join(" & ")}) → ${results.length} produits`
+  );
   return results;
 }
 
 // ---------------------------------------------------------------------
-// 📸 SNAPSHOT STOCK INITIAL (utilise fetchProductsByTag)
+// 📸 SNAPSHOT STOCK INITIAL (multi-balises)
 // ---------------------------------------------------------------------
 
 app.post("/api/initial_stock/snapshot", async (req, res) => {
@@ -179,14 +183,23 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
     const { season } = req.body;
     if (!season) return res.status(400).json({ error: "season required" });
 
-    const tag = season.trim();
-    console.log("📌 Snapshot pour la balise (exacte) :", tag);
+    // Exemple d'input : "FW25, HOMME" ou "adidas;FW25"
+    const raw = season.trim();
+    const tagParts = raw.split(/[;,]/).map((t) => t.trim()).filter(Boolean);
 
-    // 1) Tous les produits (toutes les pages) avec cette balise
-    const taggedProducts = await fetchProductsByTag(tag);
+    if (!tagParts.length) {
+      return res.status(400).json({ error: "no valid tags in season field" });
+    }
+
+    console.log("📌 Snapshot pour les balises :", tagParts.join(" & "));
+
+    // 1) Tous les produits qui ont TOUTES ces balises
+    const taggedProducts = await fetchProductsByTags(tagParts);
 
     console.log(
-      `📦 ${taggedProducts.length} produits avec la balise exacte '${tag}'`
+      `📦 ${taggedProducts.length} produits avec toutes les balises [${tagParts.join(
+        ", "
+      )}]`
     );
 
     // 2) Préparation des variantes
@@ -246,7 +259,8 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
       variant_title: v.variant_title,
       image: v.image,
       initial_qty: inventoryMap.get(v.inventory_item_id) || 0,
-      season: tag,
+      // On enregistre la "saison" telle que saisie (ex: "FW25, HOMME")
+      season: raw,
     }));
 
     await Promise.all(
