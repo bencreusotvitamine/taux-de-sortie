@@ -8,9 +8,9 @@ import { initDb, db } from "./db.js";
 
 dotenv.config();
 
-// ---------------------------------------------------------------------
-// 🗄️ DB : s'assurer que les colonnes existent
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 🔧 DB : s'assurer que les colonnes existent                                */
+/* -------------------------------------------------------------------------- */
 
 async function ensureSchema() {
   async function addColumnIfMissing(table, column, type) {
@@ -21,22 +21,27 @@ async function ensureSchema() {
       if (e.message?.includes("duplicate column name")) {
         console.log(`ℹ️ Colonne déjà présente : ${table}.${column}`);
       } else {
-        console.warn(`⚠️ Problème ajout colonne ${column} :`, e.message);
+        console.warn(`⚠️ Problème ajout colonne ${table}.${column} :`, e.message);
       }
     }
   }
 
+  // Pour l'écran
   await addColumnIfMissing("initial_stock", "product_title", "TEXT");
   await addColumnIfMissing("initial_stock", "variant_title", "TEXT");
   await addColumnIfMissing("initial_stock", "image", "TEXT");
+  await addColumnIfMissing("initial_stock", "inventory_item_id", "INTEGER");
+
+  // Pour suivre les réceptions (delta)
+  await addColumnIfMissing("inventory_changes", "delta", "INTEGER");
 }
 
 await initDb();
 await ensureSchema();
 
-// ---------------------------------------------------------------------
-// 📦 Config Shopify
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 📦 Config Shopify                                                          */
+/* -------------------------------------------------------------------------- */
 
 const RAW_SHOP_NAME = (process.env.SHOP_NAME || "").trim();
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
@@ -51,9 +56,9 @@ if (!SHOP_DOMAIN.includes(".")) SHOP_DOMAIN = `${SHOP_DOMAIN}.myshopify.com`;
 
 console.log("🛍️ Shopify domain utilisé :", SHOP_DOMAIN);
 
-// ---------------------------------------------------------------------
-// 🌐 App Express
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 🌐 App Express                                                             */
+/* -------------------------------------------------------------------------- */
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -62,15 +67,15 @@ const app = express();
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// ---------------------------------------------------------------------
-// 🔁 Utilitaires
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 🔁 Utilitaires Shopify                                                     */
+/* -------------------------------------------------------------------------- */
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Renvoie la réponse complète (data + headers)
+// Réponse complète (data + headers)
 async function shopifyGetRaw(pathUrl, params = {}, retry = 0) {
   const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/${pathUrl}`;
   console.log("➡️ Shopify GET (raw) :", url, params);
@@ -94,7 +99,7 @@ async function shopifyGetRaw(pathUrl, params = {}, retry = 0) {
   }
 }
 
-// Version simple (seulement data)
+// Version simple (juste data)
 async function shopifyGet(pathUrl, params = {}, retry = 0) {
   const res = await shopifyGetRaw(pathUrl, params, retry);
   return res.data;
@@ -108,9 +113,9 @@ function chunkArray(arr, size) {
   return out;
 }
 
-// ---------------------------------------------------------------------
-// 📥 Récupère TOUS les produits qui ont TOUTES les balises demandées
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 📥 Récupère TOUS les produits qui ont TOUTES les balises demandées        */
+/* -------------------------------------------------------------------------- */
 
 async function fetchProductsByTags(tagsArray) {
   const requiredTags = tagsArray
@@ -151,17 +156,13 @@ async function fetchProductsByTags(tagsArray) {
         .split(",")
         .map((t) => t.trim().toLowerCase());
 
-      // 👉 On ne retient le produit que si TOUTES les balises demandées sont présentes
+      // produit retenu seulement s'il a TOUTES les balises
       const hasAll = requiredTags.every((rt) => tags.includes(rt));
-      if (hasAll) {
-        results.push(p);
-      }
+      if (hasAll) results.push(p);
     }
 
     const linkHeader = res.headers["link"] || res.headers["Link"];
-    if (!linkHeader || !linkHeader.includes('rel="next"')) {
-      break;
-    }
+    if (!linkHeader || !linkHeader.includes('rel="next"')) break;
 
     const match = linkHeader.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/);
     if (!match) break;
@@ -174,18 +175,17 @@ async function fetchProductsByTags(tagsArray) {
   return results;
 }
 
-// ---------------------------------------------------------------------
-// 📸 SNAPSHOT STOCK INITIAL (multi-balises)
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 📸 SNAPSHOT : définit la liste de variantes + stock base (une seule fois) */
+/* -------------------------------------------------------------------------- */
 
 app.post("/api/initial_stock/snapshot", async (req, res) => {
   try {
     const { season } = req.body;
     if (!season) return res.status(400).json({ error: "season required" });
 
-    // Exemple d'input : "FW25, HOMME" ou "adidas;FW25"
-    const raw = season.trim();
-    const tagParts = raw.split(/[;,]/).map((t) => t.trim()).filter(Boolean);
+    const rawSeason = season.trim();
+    const tagParts = rawSeason.split(/[;,]/).map((t) => t.trim()).filter(Boolean);
 
     if (!tagParts.length) {
       return res.status(400).json({ error: "no valid tags in season field" });
@@ -193,7 +193,7 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
 
     console.log("📌 Snapshot pour les balises :", tagParts.join(" & "));
 
-    // 1) Tous les produits qui ont TOUTES ces balises
+    // 1) Tous les produits qui matchent TOUTES ces balises
     const taggedProducts = await fetchProductsByTags(tagParts);
 
     console.log(
@@ -202,7 +202,7 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
       )}]`
     );
 
-    // 2) Préparation des variantes
+    // 2) Variantes + inventory_item_id
     const variantMeta = [];
     const inventoryItemIdsSet = new Set();
 
@@ -218,9 +218,8 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
           image,
         });
 
-        if (v.inventory_item_id) {
+        if (v.inventory_item_id)
           inventoryItemIdsSet.add(v.inventory_item_id);
-        }
       }
     }
 
@@ -230,7 +229,7 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
       `🧮 Total variantes : ${variantMeta.length}, inventory_item_ids uniques : ${inventoryItemIds.length}`
     );
 
-    // 3) Récupération des stocks par paquets
+    // 3) Récupérer le stock dispo actuel par inventory_item_id
     const inventoryMap = new Map();
     const chunks = chunkArray(inventoryItemIds, 40);
 
@@ -252,47 +251,63 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
       if (i + 1 < chunks.length) await sleep(600);
     }
 
-    // 4) Sauvegarde dans la DB
-    const toInsert = variantMeta.map((v) => ({
-      variant_id: v.variant_id,
-      product_title: v.product_title,
-      variant_title: v.variant_title,
-      image: v.image,
-      initial_qty: inventoryMap.get(v.inventory_item_id) || 0,
-      // On enregistre la "saison" telle que saisie (ex: "FW25, HOMME")
-      season: raw,
-    }));
+    // 4) Pour chaque variante : soit on crée la ligne, soit on laisse le stock base existant
+    const nowIso = new Date().toISOString();
 
-    await Promise.all(
-      toInsert.map((i) =>
-        db.run(
-          `REPLACE INTO initial_stock 
-           (variant_id, product_title, variant_title, image, initial_qty, season, snapshot_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    for (const v of variantMeta) {
+      const baseQty = inventoryMap.get(v.inventory_item_id) || 0;
+
+      const existing = await db.get(
+        `SELECT * FROM initial_stock WHERE variant_id = ? AND season = ?`,
+        [v.variant_id, rawSeason]
+      );
+
+      if (!existing) {
+        // première fois pour cette saison/variante → on fixe le stock base
+        await db.run(
+          `INSERT INTO initial_stock
+           (variant_id, product_title, variant_title, image, inventory_item_id, initial_qty, season, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            i.variant_id,
-            i.product_title,
-            i.variant_title,
-            i.image,
-            i.initial_qty,
-            i.season,
-            new Date().toISOString(),
+            v.variant_id,
+            v.product_title,
+            v.variant_title,
+            v.image,
+            v.inventory_item_id,
+            baseQty,
+            rawSeason,
+            nowIso,
           ]
-        )
-      )
-    );
+        );
+      } else {
+        // déjà existant : on met à jour texte/image/mapping, mais PAS le stock base ni la date
+        await db.run(
+          `UPDATE initial_stock
+           SET product_title = ?, variant_title = ?, image = ?, inventory_item_id = ?
+           WHERE variant_id = ? AND season = ?`,
+          [
+            v.product_title,
+            v.variant_title,
+            v.image,
+            v.inventory_item_id,
+            v.variant_id,
+            rawSeason,
+          ]
+        );
+      }
+    }
 
-    console.log("✅ Snapshot terminé :", toInsert.length, "lignes.");
-    res.json({ success: true, inserted: toInsert.length });
+    console.log("✅ Snapshot terminé.");
+    res.json({ success: true, inserted: variantMeta.length });
   } catch (e) {
     console.error("❌ snapshot error", e);
     res.status(500).json({ error: "snapshot failed" });
   }
 });
 
-// ---------------------------------------------------------------------
-// 📥 IMPORT MANUEL (optionnel)
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 📥 IMPORT MANUEL (optionnel)                                              */
+/* -------------------------------------------------------------------------- */
 
 app.post("/api/initial_stock/import", async (req, res) => {
   try {
@@ -304,13 +319,14 @@ app.post("/api/initial_stock/import", async (req, res) => {
       items.map((i) =>
         db.run(
           `REPLACE INTO initial_stock 
-           (variant_id, product_title, variant_title, image, initial_qty, season, snapshot_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (variant_id, product_title, variant_title, image, inventory_item_id, initial_qty, season, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             i.variant_id,
             i.product_title || null,
             i.variant_title || null,
             i.image || null,
+            i.inventory_item_id || null,
             i.initial_qty || 0,
             season,
             new Date().toISOString(),
@@ -326,9 +342,9 @@ app.post("/api/initial_stock/import", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------
-// 🧾 Webhook : orders/create
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 🧾 Webhook : orders_create → enregistre les ventes                         */
+/* -------------------------------------------------------------------------- */
 
 app.post("/webhooks/orders_create", async (req, res) => {
   try {
@@ -358,24 +374,41 @@ app.post("/webhooks/orders_create", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------
-// 📦 Webhook : inventory_levels/update (optionnel)
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 📦 Webhook : inventory_levels_update → suit les variations de stock       */
+/* -------------------------------------------------------------------------- */
 
 app.post("/webhooks/inventory_levels_update", async (req, res) => {
   try {
     const p = req.body;
 
+    const inventory_item_id = p.inventory_item_id || null;
+    const location_id = p.location_id || null;
+    const available = p.available || 0;
+    const nowIso = new Date().toISOString();
+
+    // On récupère la dernière valeur connue pour calculer le delta
+    const last = await db.get(
+      `SELECT available FROM inventory_changes
+       WHERE inventory_item_id = ? AND location_id = ?
+       ORDER BY recorded_at DESC
+       LIMIT 1`,
+      [inventory_item_id, location_id]
+    );
+
+    let delta = 0;
+    if (last && typeof last.available === "number") {
+      delta = available - last.available;
+    } else {
+      // premier enregistrement → on met delta = 0 (on ne sait pas l'historique avant)
+      delta = 0;
+    }
+
     await db.run(
       `INSERT INTO inventory_changes
-       (inventory_item_id, location_id, available, recorded_at)
-       VALUES (?, ?, ?, ?)`,
-      [
-        p.inventory_item_id || null,
-        p.location_id || null,
-        p.available || 0,
-        new Date().toISOString(),
-      ]
+       (inventory_item_id, location_id, available, delta, recorded_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [inventory_item_id, location_id, available, delta, nowIso]
     );
 
     res.json({ success: true });
@@ -385,42 +418,72 @@ app.post("/webhooks/inventory_levels_update", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------
-// 📊 API SELL-THROUGH (tableau)
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 📊 API SELL-THROUGH : calcule stock reçu + vendu + taux                    */
+/* -------------------------------------------------------------------------- */
 
 app.get("/api/sellthrough", async (req, res) => {
   try {
     const { season } = req.query;
     if (!season) return res.status(400).json({ error: "season required" });
 
+    // 1) On récupère la photo de base (initial_stock) pour cette "saison"
     const initial = await db.all(
       `SELECT * FROM initial_stock WHERE season = ?`,
       [season]
     );
 
+    if (!initial.length) {
+      return res.json([]); // rien à afficher
+    }
+
+    // 2) On récupère toutes les ventes (sales) groupées par variant_id
     const sales = await db.all(
       `SELECT variant_id, SUM(qty) AS sold FROM sales GROUP BY variant_id`
     );
 
     const soldMap = new Map(sales.map((s) => [String(s.variant_id), s.sold]));
 
-    const results = initial.map((i) => {
-      const sold = soldMap.get(String(i.variant_id)) || 0;
-      const pct = i.initial_qty ? (sold / i.initial_qty) * 100 : 0;
+    // 3) Pour les réceptions : pour chaque variant, on va chercher les deltas > 0
+    //    après le snapshot_at correspondant.
+    const results = [];
 
-      return {
+    for (const i of initial) {
+      const sold = soldMap.get(String(i.variant_id)) || 0;
+
+      // Récupérer la somme des deltas positifs après le snapshot pour ce inventory_item_id
+      let extraReceived = 0;
+
+      if (i.inventory_item_id && i.snapshot_at) {
+        const rows = await db.all(
+          `SELECT delta FROM inventory_changes
+           WHERE inventory_item_id = ?
+             AND recorded_at >= ?
+             AND delta > 0`,
+          [i.inventory_item_id, i.snapshot_at]
+        );
+
+        extraReceived = rows.reduce((acc, r) => acc + (r.delta || 0), 0);
+      }
+
+      const base = i.initial_qty || 0;
+      const totalReceived = base + extraReceived; // stock "saison" = base + toutes les réceptions
+
+      const pct =
+        totalReceived > 0 ? (sold / totalReceived) * 100 : 0;
+
+      results.push({
         product_title: i.product_title,
         variant_title: i.variant_title,
         image: i.image,
-        initial: i.initial_qty,
+        initial: totalReceived,          // ce qu'on affiche comme "Stock départ"
         sold,
         sell_through_pct: Number(pct.toFixed(1)),
-      };
-    });
-    // 🔤 Tri alphabétique
-results.sort((a, b) => a.product_title.localeCompare(b.product_title));
+      });
+    }
 
+    // 🔤 Tri alphabétique par nom du produit
+    results.sort((a, b) => a.product_title.localeCompare(b.product_title));
 
     res.json(results);
   } catch (e) {
@@ -429,9 +492,9 @@ results.sort((a, b) => a.product_title.localeCompare(b.product_title));
   }
 });
 
-// ---------------------------------------------------------------------
-// 🚀 Start server
-// ---------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* 🚀 Start server                                                            */
+/* -------------------------------------------------------------------------- */
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
