@@ -7,7 +7,66 @@ import { fileURLToPath } from "url";
 import { initDb, db } from "./db.js";
 
 dotenv.config();
+
+// ---------------------------------------------------------------------
+// 🗄️ Sécurité : on s'assure que la DB est prête et a bien les colonnes
+// ---------------------------------------------------------------------
+
+async function ensureSchema() {
+  // Ajoute une colonne si elle n'existe pas déjà
+  async function addColumnIfMissing(table, column, type) {
+    try {
+      await db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      console.log(`✅ Colonne ajoutée : ${table}.${column}`);
+    } catch (e) {
+      // SQLite renvoie une erreur si la colonne existe déjà → on ignore
+      if (e.message?.includes("duplicate column name")) {
+        console.log(`ℹ️ Colonne déjà présente : ${table}.${column}`);
+      } else {
+        console.warn(
+          `⚠️ Problème lors de l'ajout de ${table}.${column} :`,
+          e.message
+        );
+      }
+    }
+  }
+
+  // On s'assure que initial_stock possède bien ces colonnes
+  await addColumnIfMissing("initial_stock", "product_title", "TEXT");
+  await addColumnIfMissing("initial_stock", "variant_title", "TEXT");
+  await addColumnIfMissing("initial_stock", "image", "TEXT");
+}
+
 await initDb();
+await ensureSchema();
+
+// ---------------------------------------------------------------------
+// 📦 Config Shopify (SHOP_NAME peut être domaine ou URL complète)
+// ---------------------------------------------------------------------
+
+const RAW_SHOP_NAME = (process.env.SHOP_NAME || "").trim();
+const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+const API_VERSION = process.env.API_VERSION || "2024-10";
+
+if (!RAW_SHOP_NAME || !ADMIN_API_TOKEN) {
+  console.warn("⚠️ SHOP_NAME ou ADMIN_API_TOKEN non définis dans les variables d'environnement");
+}
+
+// Normalisation du domaine Shopify
+let SHOP_DOMAIN = RAW_SHOP_NAME
+  .replace(/^https?:\/\//, "") // enlève https://
+  .replace(/\/admin.*$/i, "")  // enlève /admin/...
+  .replace(/\/$/, "");         // enlève / final
+
+if (!SHOP_DOMAIN.includes(".")) {
+  SHOP_DOMAIN = `${SHOP_DOMAIN}.myshopify.com`;
+}
+
+console.log("🛍️  Domaine Shopify utilisé :", SHOP_DOMAIN);
+
+// ---------------------------------------------------------------------
+// 🌐 App Express
+// ---------------------------------------------------------------------
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,111 +75,173 @@ const app = express();
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-const SHOP_NAME = process.env.SHOP_NAME;
-const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
-const API_VERSION = process.env.API_VERSION || "2024-10";
+// ---------------------------------------------------------------------
+// 🔁 Utilitaires
+// ---------------------------------------------------------------------
 
-if (!SHOP_NAME || !ADMIN_API_TOKEN) {
-  console.warn("⚠️ SHOP_NAME ou ADMIN_API_TOKEN non définis dans .env");
-}
-
-// -----------------------------------------------------
-// 🟢 Fonction intelligente shopifyGet() avec délai anti-429
-// -----------------------------------------------------
-async function delay(ms) {
+function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function shopifyGet(pathUrl, params = {}) {
-  const url = `https://${SHOP_NAME}/admin/api/${API_VERSION}/${pathUrl}`;
-
-  console.log("➡️ Appel Shopify :", url);
+async function shopifyGet(pathUrl, params = {}, retry = 0) {
+  const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/${pathUrl}`;
+  console.log("➡️ Appel Shopify :", url, params);
 
   try {
     const res = await axios.get(url, {
       headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
       params,
     });
-
-    await delay(150); // ralentit un peu les requêtes pour éviter 429
     return res.data;
-  } catch (e) {
-    if (e.response?.status === 429) {
-      console.log("⏳ 429 reçu → pause 2 secondes…");
-      await delay(2000);
-      return shopifyGet(pathUrl, params); // retry automatique
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status === 429 && retry < 5) {
+      // Limite Shopify dépassée → on attend et on réessaie
+      const retryAfterHeader = err.response.headers["retry-after"];
+      const retryAfterSec = retryAfterHeader ? Number(retryAfterHeader) : 2;
+      console.warn(
+        `⚠️ Rate limit 429. Attente ${retryAfterSec}s puis retry (${retry + 1}/5).`
+      );
+      await sleep(retryAfterSec * 1000 + 200);
+      return shopifyGet(pathUrl, params, retry + 1);
     }
 
-    console.error("❌ shopifyGet error:", e);
-    throw e;
+    console.error("❌ Shopify error", status, err.response?.data || err.message);
+    throw err;
   }
 }
 
-// -----------------------------------------------------
-// 🟦 API SNAPSHOT — Recherche par TAG (saison)
-// -----------------------------------------------------
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+// ---------------------------------------------------------------------
+// 📸 SNAPSHOT STOCK INITIAL (filtré par TAG = Saison)
+// ---------------------------------------------------------------------
+
 app.post("/api/initial_stock/snapshot", async (req, res) => {
   try {
     const { season } = req.body;
     if (!season) return res.status(400).json({ error: "season required" });
 
-    console.log("📌 Snapshot saison =", season);
+    const tag = season.trim();
+    const tagLower = tag.toLowerCase();
+    console.log("📌 Snapshot pour la balise (saison) :", tag);
 
-    const products = await shopifyGet("products.json", {
+    // 1) Récupérer jusqu'à 250 produits
+    const productsData = await shopifyGet("products.json", {
       limit: 250,
       fields: "id,title,tags,variants,images",
     });
+    const allProducts = productsData.products || [];
 
-    // 👉 filtrage par TAG
-    const taggedProducts = products.products.filter((p) =>
-      p.tags.toLowerCase().includes(season.toLowerCase())
+    // 2) Filtrer par balise
+    const taggedProducts = allProducts.filter((p) => {
+      if (!p.tags) return false;
+      return p.tags
+        .split(",")
+        .map((t) => t.trim().toLowerCase())
+        .includes(tagLower);
+    });
+
+    console.log(
+      `📦 ${allProducts.length} produits trouvés, ${taggedProducts.length} avec la balise '${tag}'`
     );
 
-    const toInsert = [];
+    // 3) Construire la liste des variantes et des inventory_item_ids
+    const variantMeta = [];
+    const inventoryItemIdsSet = new Set();
 
     for (const p of taggedProducts) {
       const productImage = p.images?.[0]?.src || null;
 
-      for (const v of p.variants) {
-        const inv = await shopifyGet("inventory_levels.json", {
-          inventory_item_ids: v.inventory_item_id,
-        });
-
-        let qty = 0;
-        if (inv?.inventory_levels?.length) {
-          qty = inv.inventory_levels.reduce((acc, lvl) => acc + lvl.available, 0);
-        }
-
-        toInsert.push({
+      for (const v of p.variants || []) {
+        variantMeta.push({
           variant_id: v.id,
+          inventory_item_id: v.inventory_item_id,
           product_title: p.title,
           variant_title: v.title,
           image: productImage,
-          initial_qty: qty,
-          season,
         });
+
+        if (v.inventory_item_id) {
+          inventoryItemIdsSet.add(v.inventory_item_id);
+        }
       }
     }
 
-    const queries = toInsert.map((i) =>
-      db.run(
-        `REPLACE INTO initial_stock
-         (variant_id, product_title, variant_title, image, initial_qty, season, snapshot_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          i.variant_id,
-          i.product_title,
-          i.variant_title,
-          i.image,
-          i.initial_qty,
-          i.season,
-          new Date().toISOString(),
-        ]
+    const inventoryItemIds = Array.from(inventoryItemIdsSet);
+    console.log(
+      `🧮 ${variantMeta.length} variantes, ${inventoryItemIds.length} inventory_item_ids uniques`
+    );
+
+    // 4) Récupérer les niveaux de stock par paquets
+    const chunkSize = 40;
+    const idChunks = chunkArray(inventoryItemIds, chunkSize);
+    const inventoryMap = new Map(); // inventory_item_id -> qty
+
+    for (let index = 0; index < idChunks.length; index++) {
+      const idsChunk = idChunks[index];
+      console.log(
+        `📡 Chunk ${index + 1}/${idChunks.length} - ${idsChunk.length} IDs`
+      );
+
+      const invData = await shopifyGet("inventory_levels.json", {
+        inventory_item_ids: idsChunk.join(","),
+        limit: 250,
+      });
+
+      const levels = invData.inventory_levels || [];
+      for (const lvl of levels) {
+        const id = lvl.inventory_item_id;
+        const current = inventoryMap.get(id) || 0;
+        inventoryMap.set(id, current + (lvl.available ?? 0));
+      }
+
+      if (index + 1 < idChunks.length) {
+        await sleep(600); // petite pause entre les paquets
+      }
+    }
+
+    console.log(
+      `📊 Inventaire récupéré pour ${inventoryMap.size} inventory_item_ids`
+    );
+
+    // 5) Préparer les lignes à insérer
+    const toInsert = variantMeta.map((m) => ({
+      variant_id: m.variant_id,
+      product_title: m.product_title,
+      variant_title: m.variant_title,
+      image: m.image,
+      initial_qty: inventoryMap.get(m.inventory_item_id) || 0,
+      season: tag,
+    }));
+
+    // 6) Sauvegarde en DB
+    await Promise.all(
+      toInsert.map((i) =>
+        db.run(
+          `REPLACE INTO initial_stock 
+           (variant_id, product_title, variant_title, image, initial_qty, season, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            i.variant_id,
+            i.product_title,
+            i.variant_title,
+            i.image,
+            i.initial_qty,
+            i.season,
+            new Date().toISOString(),
+          ]
+        )
       )
     );
 
-    await Promise.all(queries);
-
+    console.log(`✅ Snapshot terminé. Lignes insérées : ${toInsert.length}`);
     res.json({ success: true, inserted: toInsert.length });
   } catch (e) {
     console.error("❌ snapshot error", e);
@@ -128,20 +249,57 @@ app.post("/api/initial_stock/snapshot", async (req, res) => {
   }
 });
 
-// -----------------------------------------------------
-// 🟧 Webhook : orders/create
-// -----------------------------------------------------
+// ---------------------------------------------------------------------
+// (Optionnel) Import manuel initial_stock via JSON/CSV
+// ---------------------------------------------------------------------
+
+app.post("/api/initial_stock/import", async (req, res) => {
+  try {
+    const { season, items } = req.body;
+    if (!season || !items)
+      return res.status(400).json({ error: "season + items required" });
+
+    await Promise.all(
+      items.map((i) =>
+        db.run(
+          `REPLACE INTO initial_stock 
+           (variant_id, product_title, variant_title, image, initial_qty, season, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            i.variant_id,
+            i.product_title || null,
+            i.variant_title || null,
+            i.image || null,
+            i.initial_qty || 0,
+            season,
+            new Date().toISOString(),
+          ]
+        )
+      )
+    );
+
+    res.json({ success: true, inserted: items.length });
+  } catch (e) {
+    console.error("❌ import error", e);
+    res.status(500).json({ error: "import failed" });
+  }
+});
+
+// ---------------------------------------------------------------------
+// 🧾 Webhook : orders/create → enregistrement des ventes
+// ---------------------------------------------------------------------
+
 app.post("/webhooks/orders_create", async (req, res) => {
   try {
     const order = req.body;
-    if (!order?.line_items) return res.status(400).end();
+    if (!order || !order.line_items) return res.status(400).end();
 
     const ops = order.line_items.map((line) =>
       db.run(
         `INSERT INTO sales (variant_id, sku, qty, order_id, created_at)
          VALUES (?, ?, ?, ?, ?)`,
         [
-          line.variant_id,
+          line.variant_id || null,
           line.sku || null,
           line.quantity || 0,
           order.id,
@@ -158,21 +316,22 @@ app.post("/webhooks/orders_create", async (req, res) => {
   }
 });
 
-// -----------------------------------------------------
-// 🟪 Webhook : inventory_levels/update
-// -----------------------------------------------------
+// ---------------------------------------------------------------------
+// 📦 Webhook : inventory_levels/update (optionnel / historique)
+// ---------------------------------------------------------------------
+
 app.post("/webhooks/inventory_levels_update", async (req, res) => {
   try {
-    const payload = req.body;
+    const p = req.body;
 
     await db.run(
-      `INSERT INTO inventory_changes
+      `INSERT INTO inventory_changes 
        (inventory_item_id, location_id, available, recorded_at)
        VALUES (?, ?, ?, ?)`,
       [
-        payload.inventory_item_id,
-        payload.location_id,
-        payload.available,
+        p.inventory_item_id || null,
+        p.location_id || null,
+        p.available || 0,
         new Date().toISOString(),
       ]
     );
@@ -184,13 +343,14 @@ app.post("/webhooks/inventory_levels_update", async (req, res) => {
   }
 });
 
-// -----------------------------------------------------
-// 🟩 API SELL-THROUGH (pour ton tableau)
-// -----------------------------------------------------
+// ---------------------------------------------------------------------
+// 📊 API SELL-THROUGH → données pour ton tableau
+// ---------------------------------------------------------------------
+
 app.get("/api/sellthrough", async (req, res) => {
   try {
     const { season } = req.query;
-    if (!season) return res.status(400).json({ error: "season param required" });
+    if (!season) return res.status(400).json({ error: "season required" });
 
     const initial = await db.all(
       `SELECT * FROM initial_stock WHERE season = ?`,
@@ -224,10 +384,11 @@ app.get("/api/sellthrough", async (req, res) => {
   }
 });
 
-// -----------------------------------------------------
-// 🚀 Démarrage serveur
-// -----------------------------------------------------
+// ---------------------------------------------------------------------
+// 🚀 Démarrage du serveur
+// ---------------------------------------------------------------------
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 TAUX DE SORTIE actif sur port ${PORT}`);
+  console.log(`🚀 TAUX DE SORTIE démarrée sur le port ${PORT}`);
 });
