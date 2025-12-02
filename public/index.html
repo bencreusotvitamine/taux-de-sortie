@@ -15,6 +15,11 @@
     }
     h1 {
       font-size: 22px;
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: #6b7280;
       margin-bottom: 16px;
     }
     .card {
@@ -38,12 +43,23 @@
       flex-direction: column;
       gap: 4px;
     }
-    input {
+    .inline-label {
+      flex-direction: row;
+      align-items: center;
+      gap: 6px;
+      margin-top: 16px;
+    }
+    input[type="text"],
+    input[type="number"] {
       padding: 8px 10px;
       border-radius: 8px;
       border: 1px solid #d1d5db;
       font-size: 14px;
-      min-width: 160px;
+      min-width: 140px;
+    }
+    input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
     }
     button {
       padding: 8px 14px;
@@ -69,6 +85,35 @@
       font-size: 13px;
       color: #4b5563;
       margin-top: 4px;
+    }
+    .alert-summary {
+      font-size: 13px;
+      color: #4b5563;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-top: 8px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: #fef2f2;
+      color: #b91c1c;
+    }
+    .pill-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #dc2626;
+    }
+    .pill-secondary {
+      font-size: 12px;
+      color: #6b7280;
     }
     table {
       width: 100%;
@@ -111,6 +156,9 @@
       font-size: 13px;
       font-weight: 500;
       color: #111827;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
     .prod-text-sub {
       font-size: 12px;
@@ -157,6 +205,24 @@
     .badge-green .badge-dot { background: #16a34a; }
     .badge-orange .badge-dot { background: #f97316; }
     .badge-red .badge-dot { background: #dc2626; }
+
+    .row-low {
+      background: #fef2f2;
+    }
+    .row-low:hover {
+      background: #fee2e2;
+    }
+    .alert-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: #b91c1c;
+      background: #fee2e2;
+      border-radius: 999px;
+      padding: 2px 6px;
+      margin-left: 4px;
+    }
     .empty {
       text-align: center;
       padding: 20px;
@@ -167,17 +233,27 @@
       body { padding: 12px; }
       table { font-size: 12px; }
       th, td { padding: 6px 6px; }
+      .controls {
+        align-items: flex-start;
+      }
     }
   </style>
 </head>
 <body>
   <h1>TAUX DE SORTIE</h1>
+  <div class="subtitle">
+    Suivi saison par saison (balises Shopify) avec réassorts, ventes, et alertes sur les produits qui sortent peu.
+  </div>
 
   <div class="card">
     <div class="controls">
       <label>
         Saison / Balises Shopify
-        <input id="season" placeholder="Ex : FW25, HOMME" />
+        <input id="season" type="text" placeholder="Ex : FW25, HOMME" />
+      </label>
+      <label>
+        Seuil stock alertes
+        <input id="minStockAlert" type="number" value="10" min="0" />
       </label>
       <button id="snapshotBtn">
         📸 Définir le stock de départ
@@ -185,8 +261,21 @@
       <button id="refreshBtn" class="secondary">
         🔄 Rafraîchir les données
       </button>
+      <label class="inline-label">
+        <input type="checkbox" id="onlyAlerts" />
+        <span>Afficher seulement les produits en alerte</span>
+      </label>
     </div>
     <div id="status"></div>
+    <div id="alertSummary" class="alert-summary" style="display:none;">
+      <span class="pill">
+        <span class="pill-dot"></span>
+        <span id="alertCountText"></span>
+      </span>
+      <span class="pill-secondary">
+        Alerte = stock saison ≥ seuil et peu ou pas de ventes (0 vente ou &lt; 20% de taux de sortie).
+      </span>
+    </div>
   </div>
 
   <div class="card">
@@ -214,9 +303,21 @@
     const seasonInput = document.getElementById("season");
     const snapshotBtn = document.getElementById("snapshotBtn");
     const refreshBtn = document.getElementById("refreshBtn");
+    const onlyAlertsCheckbox = document.getElementById("onlyAlerts");
+    const alertSummary = document.getElementById("alertSummary");
+    const alertCountText = document.getElementById("alertCountText");
+    const minStockAlertInput = document.getElementById("minStockAlert");
+
+    let lastRows = [];
 
     function setStatus(msg) {
       statusEl.textContent = msg || "";
+    }
+
+    function getMinStockAlert() {
+      const v = parseInt(minStockAlertInput.value, 10);
+      if (Number.isNaN(v) || v < 0) return 0;
+      return v;
     }
 
     function pctClass(pct) {
@@ -237,14 +338,59 @@
       return '<span class="badge badge-red"><span class="badge-dot"></span> Faible</span>';
     }
 
+    // ⚠️ Règle d'alerte :
+    // - On ignore toutes les variantes dont le stock saison total est en dessous du seuil choisi
+    // - Sinon : alerte si (sold == 0) OU (taux < 20%)
+    function isAlert(row) {
+      const base = row.initial_base ?? 0;
+      const extra = row.extra_received ?? 0;
+      const total = row.initial_total ?? (base + extra);
+      const sold = row.sold ?? 0;
+      const pct = row.sell_through_pct ?? 0;
+      const minStock = getMinStockAlert();
+
+      if (total < minStock) return false;   // petites séries ignorées
+
+      if (sold === 0) return true;
+      if (pct < 20) return true;
+
+      return false;
+    }
+
+    function updateAlertSummary(rows) {
+      const alertRows = rows.filter(isAlert);
+      if (!rows.length || !alertRows.length) {
+        alertSummary.style.display = "none";
+        return;
+      }
+      alertSummary.style.display = "flex";
+      const n = alertRows.length;
+      alertCountText.textContent =
+        n === 1
+          ? "1 produit en alerte"
+          : n + " produits en alerte";
+    }
+
     function renderRows(rows) {
-      if (!rows || !rows.length) {
+      lastRows = rows || [];
+
+      if (!lastRows.length) {
         tbody.innerHTML = '<tr><td colspan="7" class="empty">Aucune donnée pour cette sélection.</td></tr>';
+        updateAlertSummary(lastRows);
+        return;
+      }
+
+      const onlyAlerts = onlyAlertsCheckbox.checked;
+      const rowsToShow = onlyAlerts ? lastRows.filter(isAlert) : lastRows;
+
+      if (!rowsToShow.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty">Aucun produit ne correspond au filtre actuel.</td></tr>';
+        updateAlertSummary(lastRows);
         return;
       }
 
       tbody.innerHTML = "";
-      rows.forEach((r) => {
+      rowsToShow.forEach((r) => {
         const tr = document.createElement("tr");
 
         const img = r.image || "";
@@ -256,6 +402,11 @@
         const restocks = r.restock_count ?? 0;
         const sold = r.sold ?? 0;
         const pct = r.sell_through_pct ?? 0;
+        const alert = isAlert(r);
+
+        if (alert) {
+          tr.classList.add("row-low");
+        }
 
         tr.innerHTML = `
           <td>
@@ -266,7 +417,14 @@
                   : `<div class="prod-img"></div>`
               }
               <div>
-                <div class="prod-text-main">${productTitle}</div>
+                <div class="prod-text-main">
+                  ${productTitle}
+                  ${
+                    alert
+                      ? '<span class="alert-tag"><span>⚠️</span><span>Faible sortie</span></span>'
+                      : ""
+                  }
+                </div>
                 <div class="prod-text-sub">
                   Base : ${base} &nbsp;·&nbsp; Réassort : ${extra} (${restocks} réassort${restocks > 1 ? "s" : ""})
                 </div>
@@ -288,6 +446,8 @@
 
         tbody.appendChild(tr);
       });
+
+      updateAlertSummary(lastRows);
     }
 
     async function doSnapshot() {
@@ -338,7 +498,7 @@
         const res = await fetch("/api/sellthrough?season=" + encodeURIComponent(season));
         const data = await res.json();
         renderRows(data);
-        setStatus("✅ Données mises à jour (" + data.length + " lignes).");
+        setStatus("✅ Données mises à jour (" + data.length + " lignes avant filtre).");
       } catch (e) {
         console.error(e);
         setStatus("❌ Erreur lors du chargement des données.");
@@ -347,6 +507,8 @@
 
     snapshotBtn.addEventListener("click", doSnapshot);
     refreshBtn.addEventListener("click", refresh);
+    onlyAlertsCheckbox.addEventListener("change", () => renderRows(lastRows));
+    minStockAlertInput.addEventListener("change", () => renderRows(lastRows));
   </script>
 </body>
 </html>
