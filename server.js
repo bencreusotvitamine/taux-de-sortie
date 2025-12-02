@@ -419,7 +419,7 @@ app.post("/webhooks/inventory_levels_update", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 📊 API SELL-THROUGH : calcule stock reçu + vendu + taux                    */
+/* 📊 API SELL-THROUGH : base + réassorts + vendu + taux                      */
 /* -------------------------------------------------------------------------- */
 
 app.get("/api/sellthrough", async (req, res) => {
@@ -434,7 +434,7 @@ app.get("/api/sellthrough", async (req, res) => {
     );
 
     if (!initial.length) {
-      return res.json([]); // rien à afficher
+      return res.json([]);
     }
 
     // 2) On récupère toutes les ventes (sales) groupées par variant_id
@@ -444,15 +444,15 @@ app.get("/api/sellthrough", async (req, res) => {
 
     const soldMap = new Map(sales.map((s) => [String(s.variant_id), s.sold]));
 
-    // 3) Pour les réceptions : pour chaque variant, on va chercher les deltas > 0
-    //    après le snapshot_at correspondant.
+    // 3) Pour chaque variante : base, réassorts, total, vendu, taux
     const results = [];
 
     for (const i of initial) {
       const sold = soldMap.get(String(i.variant_id)) || 0;
 
-      // Récupérer la somme des deltas positifs après le snapshot pour ce inventory_item_id
+      const base = i.initial_qty || 0;
       let extraReceived = 0;
+      let restockCount = 0;
 
       if (i.inventory_item_id && i.snapshot_at) {
         const rows = await db.all(
@@ -464,11 +464,10 @@ app.get("/api/sellthrough", async (req, res) => {
         );
 
         extraReceived = rows.reduce((acc, r) => acc + (r.delta || 0), 0);
+        restockCount = rows.length;
       }
 
-      const base = i.initial_qty || 0;
-      const totalReceived = base + extraReceived; // stock "saison" = base + toutes les réceptions
-
+      const totalReceived = base + extraReceived;
       const pct =
         totalReceived > 0 ? (sold / totalReceived) * 100 : 0;
 
@@ -476,7 +475,10 @@ app.get("/api/sellthrough", async (req, res) => {
         product_title: i.product_title,
         variant_title: i.variant_title,
         image: i.image,
-        initial: totalReceived,          // ce qu'on affiche comme "Stock départ"
+        initial_base: base,          // stock snapshot
+        extra_received: extraReceived, // total réassorts
+        initial_total: totalReceived,  // stock saison = base + réassorts
+        restock_count: restockCount,   // nombre de réassorts
         sold,
         sell_through_pct: Number(pct.toFixed(1)),
       });
