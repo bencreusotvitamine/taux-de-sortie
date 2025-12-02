@@ -225,7 +225,8 @@
 <body>
   <h1>TAUX DE SORTIE</h1>
   <div class="subtitle">
-    Suivi saison par saison (balises Shopify) avec réassorts, ventes, alertes, taux global et Top 10 meilleures sorties.
+    Suivi saison par saison (balises Shopify) avec réassorts, ventes, alertes, taux global et Top 10.
+    <br/>📌 Le tableau est maintenant <strong>agrégé par produit</strong> (toutes variantes regroupées).
   </div>
 
   <!-- 🔧 CONTROLES -->
@@ -277,7 +278,7 @@
       <thead>
         <tr>
           <th>Produit</th>
-          <th>Variante</th>
+          <th>Variantes</th>
           <th>Stock base</th>
           <th>Réassort total</th>
           <th>Stock saison</th>
@@ -293,13 +294,13 @@
 
   <!-- ⭐ TOP 10 MEILLEURES SORTIES -->
   <div class="card">
-    <div class="card-title">Top 10 meilleures sorties (sur la sélection)</div>
+    <div class="card-title">Top 10 meilleures sorties (par produit sur la sélection)</div>
     <table>
       <thead>
         <tr>
           <th>#</th>
           <th>Produit</th>
-          <th>Variante</th>
+          <th>Variantes</th>
           <th>Stock saison</th>
           <th>Vendu</th>
           <th>Taux</th>
@@ -326,7 +327,7 @@
     const globalSoldEl = document.getElementById("globalSold");
     const globalRateEl = document.getElementById("globalRate");
 
-    let lastRows = [];
+    let lastRows = []; // agrégés par produit
 
     function setStatus(msg) {
       statusEl.textContent = msg || "";
@@ -352,9 +353,72 @@
       return "❄️ Faible";
     }
 
-    // ⚠️ Règle d'alerte :
-    // - ignore les variantes avec stock saison < seuil
-    // - sinon alerte si 0 vendu ou taux < 20%
+    // Agrégation par produit (toutes variantes regroupées)
+    function aggregateByProduct(rows) {
+      const map = new Map();
+
+      rows.forEach((r) => {
+        const key = r.product_title || "Produit sans nom";
+        let agg = map.get(key);
+        if (!agg) {
+          agg = {
+            product_title: key,
+            image: r.image || null,
+            variant_titles: new Set(),
+            variant_count: 0,
+            initial_base: 0,
+            extra_received: 0,
+            initial_total: 0,
+            restock_count: 0,
+            sold: 0,
+          };
+          map.set(key, agg);
+        }
+
+        const base = r.initial_base ?? 0;
+        const extra = r.extra_received ?? 0;
+        const total = r.initial_total ?? (base + extra);
+        const restocks = r.restock_count ?? 0;
+        const sold = r.sold ?? 0;
+
+        agg.initial_base += base;
+        agg.extra_received += extra;
+        agg.initial_total += total;
+        agg.restock_count += restocks;
+        agg.sold += sold;
+
+        if (r.image && !agg.image) agg.image = r.image;
+        if (r.variant_title) {
+          if (!agg.variant_titles.has(r.variant_title)) {
+            agg.variant_titles.add(r.variant_title);
+            agg.variant_count++;
+          }
+        }
+      });
+
+      const result = Array.from(map.values()).map((agg) => {
+        const total = agg.initial_total;
+        const pct = total > 0 ? (agg.sold / total) * 100 : 0;
+        return {
+          product_title: agg.product_title,
+          image: agg.image,
+          variant_titles: Array.from(agg.variant_titles),
+          variant_count: agg.variant_count,
+          initial_base: agg.initial_base,
+          extra_received: agg.extra_received,
+          initial_total: agg.initial_total,
+          restock_count: agg.restock_count,
+          sold: agg.sold,
+          sell_through_pct: Number(pct.toFixed(1)),
+        };
+      });
+
+      // tri alpha par produit
+      result.sort((a, b) => a.product_title.localeCompare(b.product_title));
+      return result;
+    }
+
+    // ⚠️ Règle d'alerte
     function isAlert(row) {
       const base = row.initial_base ?? 0;
       const extra = row.extra_received ?? 0;
@@ -381,7 +445,7 @@
         n === 1 ? "1 produit en alerte" : n + " produits en alerte";
     }
 
-    // ⭐ TOP 10
+    // ⭐ Top 10 par produit
     function updateTop10(rows) {
       if (!rows || !rows.length) {
         tbodyTop10.innerHTML =
@@ -389,9 +453,8 @@
         return;
       }
 
-      // on ne garde que les variantes avec stock > 0 et ventes > 0
       const filtered = rows
-        .map(r => {
+        .map((r) => {
           const base = r.initial_base ?? 0;
           const extra = r.extra_received ?? 0;
           const total = r.initial_total ?? (base + extra);
@@ -399,7 +462,7 @@
           const pct = r.sell_through_pct ?? 0;
           return { ...r, _total: total, _sold: sold, _pct: pct };
         })
-        .filter(r => r._total > 0 && r._sold > 0);
+        .filter((r) => r._total > 0 && r._sold > 0);
 
       if (!filtered.length) {
         tbodyTop10.innerHTML =
@@ -407,18 +470,21 @@
         return;
       }
 
-      // tri décroissant par taux de sortie
       filtered.sort((a, b) => b._pct - a._pct);
-
       const top = filtered.slice(0, 10);
 
       tbodyTop10.innerHTML = "";
       top.forEach((r, index) => {
+        const variantInfo =
+          r.variant_count <= 1
+            ? (r.variant_titles[0] || "1 variante")
+            : `${r.variant_count} variantes`;
+
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td>${index + 1}</td>
           <td>${r.product_title || ""}</td>
-          <td><span class="chip">${r.variant_title || "—"}</span></td>
+          <td><span class="chip">${variantInfo}</span></td>
           <td>${r._total}</td>
           <td>${r._sold}</td>
           <td class="pct-cell ${pctClass(r._pct)}">
@@ -429,19 +495,21 @@
       });
     }
 
-    function renderRows(rows) {
-      lastRows = rows || [];
+    function renderRows(variantRowsFromServer) {
+      // 1) on agrège par produit
+      const aggregated = aggregateByProduct(variantRowsFromServer || []);
+      lastRows = aggregated;
 
-      // 📊 CALCUL GLOBAL
+      // 2) stats globales
       let totalStock = 0;
       let totalSold = 0;
 
-      rows.forEach((r) => {
+      aggregated.forEach((r) => {
         const base = r.initial_base ?? 0;
         const extra = r.extra_received ?? 0;
+        const total = r.initial_total ?? (base + extra);
         const sold = r.sold ?? 0;
-        const seasonStock = r.initial_total ?? (base + extra);
-        totalStock += seasonStock;
+        totalStock += total;
         totalSold += sold;
       });
 
@@ -450,23 +518,23 @@
       globalSoldEl.textContent = totalSold;
       globalRateEl.textContent = globalRate.toFixed(1) + " %";
 
-      // 🟦 Rendu tableau principal
-      if (!lastRows.length) {
+      // 3) affichage tableau principal
+      if (!aggregated.length) {
         tbody.innerHTML =
           '<tr><td colspan="7" class="empty">Aucune donnée pour cette sélection.</td></tr>';
-        updateAlertSummary(lastRows);
-        updateTop10(lastRows);
+        updateAlertSummary(aggregated);
+        updateTop10(aggregated);
         return;
       }
 
       const onlyAlerts = onlyAlertsCheckbox.checked;
-      const rowsToShow = onlyAlerts ? lastRows.filter(isAlert) : lastRows;
+      const rowsToShow = onlyAlerts ? aggregated.filter(isAlert) : aggregated;
 
       if (!rowsToShow.length) {
         tbody.innerHTML =
           '<tr><td colspan="7" class="empty">Aucun produit ne correspond au filtre actuel.</td></tr>';
-        updateAlertSummary(lastRows);
-        updateTop10(lastRows);
+        updateAlertSummary(aggregated);
+        updateTop10(aggregated);
         return;
       }
 
@@ -476,7 +544,6 @@
 
         const img = r.image || "";
         const productTitle = r.product_title || "";
-        const variantTitle = r.variant_title || "";
         const base = r.initial_base ?? 0;
         const extra = r.extra_received ?? 0;
         const total = r.initial_total ?? (base + extra);
@@ -484,6 +551,11 @@
         const sold = r.sold ?? 0;
         const pct = r.sell_through_pct ?? 0;
         const alert = isAlert(r);
+
+        const variantInfo =
+          r.variant_count <= 1
+            ? (r.variant_titles[0] || "1 variante")
+            : `${r.variant_count} variantes`;
 
         if (alert) tr.classList.add("row-low");
 
@@ -510,7 +582,7 @@
               </div>
             </div>
           </td>
-          <td><span class="chip">${variantTitle || "—"}</span></td>
+          <td><span class="chip">${variantInfo}</span></td>
           <td>${base}</td>
           <td>${extra}</td>
           <td>${total}</td>
@@ -523,8 +595,8 @@
         tbody.appendChild(tr);
       });
 
-      updateAlertSummary(lastRows);
-      updateTop10(lastRows);
+      updateAlertSummary(aggregated);
+      updateTop10(aggregated);
     }
 
     async function doSnapshot() {
@@ -575,7 +647,7 @@
         const res = await fetch("/api/sellthrough?season=" + encodeURIComponent(season));
         const data = await res.json();
         renderRows(data);
-        setStatus("✅ Données mises à jour (" + data.length + " lignes avant filtre).");
+        setStatus("✅ Données mises à jour (" + data.length + " variantes avant agrégation).");
       } catch (e) {
         console.error(e);
         setStatus("❌ Erreur lors du chargement des données.");
