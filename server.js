@@ -418,6 +418,9 @@ app.get("/api/sellthrough", async (req, res) => {
         sell_through_pct: Number(pct.toFixed(1)),
       };
     });
+    // 🔤 Tri alphabétique
+results.sort((a, b) => a.product_title.localeCompare(b.product_title));
+
 
     res.json(results);
   } catch (e) {
