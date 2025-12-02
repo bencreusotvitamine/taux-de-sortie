@@ -1,97 +1,352 @@
 <!doctype html>
-<html>
+<html lang="fr">
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
   <title>TAUX DE SORTIE - Dashboard</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:20px;background:#f4f6f8;}
-    h1{font-size:22px;margin-bottom:16px;}
-    .card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.08);margin-bottom:16px;}
-    .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;}
-    input,select,button{padding:8px 10px;border-radius:8px;border:1px solid #d0d7de;font-size:14px;}
-    button{background:#008060;color:#fff;border:none;cursor:pointer;}
-    button:disabled{opacity:0.6;cursor:default;}
-    table{border-collapse:collapse;width:100%;background:#fff;border-radius:12px;overflow:hidden;}
-    th,td{border:1px solid #e1e4e8;padding:8px;font-size:13px;text-align:left;}
-    th{background:#f9fafb;font-weight:600;}
-    #status{font-size:13px;color:#555;margin-top:6px;}
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f4f6f8;
+      margin: 0;
+      padding: 24px;
+      color: #111827;
+    }
+    h1 {
+      font-size: 22px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: #ffffff;
+      border-radius: 12px;
+      padding: 16px 18px;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+      margin-bottom: 16px;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    label {
+      font-size: 13px;
+      color: #4b5563;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    input {
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #d1d5db;
+      font-size: 14px;
+      min-width: 120px;
+    }
+    button {
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: none;
+      font-size: 14px;
+      cursor: pointer;
+      background: #008060;
+      color: #ffffff;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button.secondary {
+      background: #e5e7eb;
+      color: #111827;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    #status {
+      font-size: 13px;
+      color: #4b5563;
+      margin-top: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    thead {
+      background: #f9fafb;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+      vertical-align: middle;
+    }
+    th {
+      font-weight: 600;
+      color: #374151;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    tr:last-child td {
+      border-bottom: none;
+    }
+    .prod-cell {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .prod-img {
+      width: 44px;
+      height: 44px;
+      border-radius: 8px;
+      object-fit: cover;
+      background: #e5e7eb;
+      flex-shrink: 0;
+    }
+    .prod-text-main {
+      font-size: 13px;
+      font-weight: 500;
+      color: #111827;
+    }
+    .prod-text-sub {
+      font-size: 12px;
+      color: #6b7280;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      background: #eef2ff;
+      color: #3730a3;
+      font-weight: 500;
+    }
+    .pct-cell {
+      font-weight: 600;
+    }
+    .pct-high {
+      color: #16a34a;
+    }
+    .pct-mid {
+      color: #f97316;
+    }
+    .pct-low {
+      color: #dc2626;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 11px;
+      background: #f3f4f6;
+      color: #4b5563;
+      gap: 4px;
+    }
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: #9ca3af;
+    }
+    .badge-green .badge-dot { background: #16a34a; }
+    .badge-orange .badge-dot { background: #f97316; }
+    .badge-red .badge-dot { background: #dc2626; }
+    .empty {
+      text-align: center;
+      padding: 20px;
+      color: #9ca3af;
+      font-size: 13px;
+    }
+    @media (max-width: 768px) {
+      body {
+        padding: 12px;
+      }
+      .controls {
+        align-items: stretch;
+      }
+      table {
+        font-size: 12px;
+      }
+      th, td {
+        padding: 6px 6px;
+      }
+    }
   </style>
 </head>
 <body>
-  <h1>TAUX DE SORTIE - Dashboard</h1>
+  <h1>TAUX DE SORTIE</h1>
+
   <div class="card">
     <div class="controls">
-      <label>Saison :
-        <input id="season" placeholder="SS25" value="SS25" />
+      <label>
+        Saison / Balise Shopify
+        <input id="season" placeholder="Ex : FW25" />
       </label>
-      <button id="snapshot">Définir le stock de départ (snapshot)</button>
-      <button id="refresh">Rafraîchir les données</button>
+      <button id="snapshotBtn">
+        📸 Définir le stock de départ
+      </button>
+      <button id="refreshBtn" class="secondary">
+        🔄 Rafraîchir les données
+      </button>
     </div>
     <div id="status"></div>
   </div>
 
   <div class="card">
-    <table id="tbl">
+    <table>
       <thead>
         <tr>
-          <th>Variant ID</th>
-          <th>SKU</th>
+          <th>Produit</th>
+          <th>Variante</th>
           <th>Stock départ</th>
           <th>Vendu</th>
-          <th>Taux de sortie %</th>
+          <th>Taux de sortie</th>
         </tr>
       </thead>
-      <tbody></tbody>
+      <tbody id="tbody">
+        <tr><td colspan="5" class="empty">Aucune donnée pour le moment.</td></tr>
+      </tbody>
     </table>
   </div>
 
   <script>
-    async function snapshot() {
-      const season = document.getElementById('season').value.trim();
-      if (!season) { alert('Indique une saison (ex: SS25)'); return; }
-      document.getElementById('status').textContent = 'Snapshot en cours...';
-      document.getElementById('snapshot').disabled = true;
-      try {
-        const r = await fetch('/api/initial_stock/snapshot', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({season})
-        });
-        const j = await r.json();
-        if (!r.ok) throw new Error(j.error || 'Erreur snapshot');
-        document.getElementById('status').textContent = 'Snapshot OK : ' + j.inserted + ' variantes enregistrées.';
-      } catch(e) {
-        console.error(e);
-        document.getElementById('status').textContent = 'Erreur snapshot.';
+    const statusEl = document.getElementById("status");
+    const tbody = document.getElementById("tbody");
+    const seasonInput = document.getElementById("season");
+    const snapshotBtn = document.getElementById("snapshotBtn");
+    const refreshBtn = document.getElementById("refreshBtn");
+
+    function setStatus(msg) {
+      statusEl.textContent = msg || "";
+    }
+
+    function pctClass(pct) {
+      if (pct == null) return "";
+      if (pct >= 70) return "pct-high";
+      if (pct >= 30) return "pct-mid";
+      return "pct-low";
+    }
+
+    function badgeForPct(pct) {
+      if (pct == null) return "";
+      if (pct >= 70) {
+        return '<span class="badge badge-green"><span class="badge-dot"></span> Forte sortie</span>';
       }
-      document.getElementById('snapshot').disabled = false;
-      refresh();
+      if (pct >= 30) {
+        return '<span class="badge badge-orange"><span class="badge-dot"></span> Moyenne</span>';
+      }
+      return '<span class="badge badge-red"><span class="badge-dot"></span> Faible</span>';
+    }
+
+    function renderRows(rows) {
+      if (!rows || !rows.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">Aucune donnée pour cette saison / balise.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = "";
+      rows.forEach((r) => {
+        const tr = document.createElement("tr");
+
+        const img = r.image || "";
+        const productTitle = r.product_title || "";
+        const variantTitle = r.variant_title || "";
+        const initial = r.initial ?? 0;
+        const sold = r.sold ?? 0;
+        const pct = r.sell_through_pct ?? 0;
+
+        tr.innerHTML = `
+          <td>
+            <div class="prod-cell">
+              ${
+                img
+                  ? `<img src="${img}" alt="" class="prod-img" />`
+                  : `<div class="prod-img"></div>`
+              }
+              <div>
+                <div class="prod-text-main">${productTitle}</div>
+                <div class="prod-text-sub">${initial} en stock au départ</div>
+              </div>
+            </div>
+          </td>
+          <td>
+            <span class="chip">${variantTitle || "—"}</span>
+          </td>
+          <td>${initial}</td>
+          <td>${sold}</td>
+          <td class="pct-cell ${pctClass(pct)}">
+            ${pct.toFixed(1)} %
+            &nbsp; ${badgeForPct(pct)}
+          </td>
+        `;
+
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function doSnapshot() {
+      const season = seasonInput.value.trim();
+      if (!season) {
+        alert("Merci de saisir une saison / balise (ex: FW25).");
+        return;
+      }
+
+      snapshotBtn.disabled = true;
+      refreshBtn.disabled = true;
+      setStatus("📸 Snapshot du stock de départ en cours…");
+
+      try {
+        const res = await fetch("/api/initial_stock/snapshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ season }),
+        });
+
+        const json = await res.json();
+        if (!res.ok) {
+          console.error(json);
+          setStatus("❌ Erreur snapshot : " + (json.error || "inconnue"));
+        } else {
+          setStatus("✅ Stock de départ enregistré (" + json.inserted + " lignes).");
+          await refresh();
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus("❌ Erreur réseau pendant le snapshot.");
+      } finally {
+        snapshotBtn.disabled = false;
+        refreshBtn.disabled = false;
+      }
     }
 
     async function refresh() {
-      const season = document.getElementById('season').value.trim();
-      if (!season) return;
-      document.getElementById('status').textContent = 'Chargement...';
-      const res = await fetch('/api/sellthrough?season=' + encodeURIComponent(season));
-      const data = await res.json();
-      const tbl = document.querySelector('#tbl tbody');
-      tbl.innerHTML = '';
-      data.forEach(r => {
-        const tr = document.createElement('tr');
-        tr.innerHTML = '<td>' + (r.variant_id||'') + '</td>' +
-                       '<td>' + (r.sku||'') + '</td>' +
-                       '<td>' + (r.initial||0) + '</td>' +
-                       '<td>' + (r.sold||0) + '</td>' +
-                       '<td>' + (r.sell_through_pct ?? '') + '</td>';
-        tbl.appendChild(tr);
-      });
-      document.getElementById('status').textContent = 'Données mises à jour.';
+      const season = seasonInput.value.trim();
+      if (!season) {
+        setStatus("Saisis une saison / balise puis clique sur Snapshot.");
+        return;
+      }
+
+      setStatus("🔄 Chargement des données…");
+
+      try {
+        const res = await fetch("/api/sellthrough?season=" + encodeURIComponent(season));
+        const data = await res.json();
+        renderRows(data);
+        setStatus("✅ Données mises à jour (" + data.length + " lignes).");
+      } catch (e) {
+        console.error(e);
+        setStatus("❌ Erreur lors du chargement des données.");
+      }
     }
 
-    document.getElementById('snapshot').addEventListener('click', snapshot);
-    document.getElementById('refresh').addEventListener('click', refresh);
-    refresh();
+    snapshotBtn.addEventListener("click", doSnapshot);
+    refreshBtn.addEventListener("click", refresh);
   </script>
 </body>
 </html>
