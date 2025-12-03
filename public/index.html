@@ -495,109 +495,172 @@
       });
     }
 
-    function renderRows(variantRowsFromServer) {
-      // 1) on agrège par produit
-      const aggregated = aggregateByProduct(variantRowsFromServer || []);
-      lastRows = aggregated;
+function renderRows(variantRowsFromServer) {
+  // Garder toutes les variantes d'origine pour les détails
+  window.allVariantsRaw = variantRowsFromServer || [];
 
-      // 2) stats globales
-      let totalStock = 0;
-      let totalSold = 0;
+  // 1) Agrégation par produit
+  const aggregated = aggregateByProduct(window.allVariantsRaw);
+  lastRows = aggregated;
 
-      aggregated.forEach((r) => {
-        const base = r.initial_base ?? 0;
-        const extra = r.extra_received ?? 0;
-        const total = r.initial_total ?? (base + extra);
-        const sold = r.sold ?? 0;
-        totalStock += total;
-        totalSold += sold;
-      });
+  // 2) Stats globales
+  let totalStock = 0;
+  let totalSold = 0;
 
-      const globalRate = totalStock > 0 ? (totalSold / totalStock) * 100 : 0;
-      globalStockEl.textContent = totalStock;
-      globalSoldEl.textContent = totalSold;
-      globalRateEl.textContent = globalRate.toFixed(1) + " %";
+  aggregated.forEach((r) => {
+    const total = r.initial_total ?? (r.initial_base + r.extra_received);
+    totalStock += total;
+    totalSold += r.sold ?? 0;
+  });
 
-      // 3) affichage tableau principal
-      if (!aggregated.length) {
-        tbody.innerHTML =
-          '<tr><td colspan="7" class="empty">Aucune donnée pour cette sélection.</td></tr>';
-        updateAlertSummary(aggregated);
-        updateTop10(aggregated);
-        return;
-      }
+  const globalRate = totalStock > 0 ? (totalSold / totalStock) * 100 : 0;
+  globalStockEl.textContent = totalStock;
+  globalSoldEl.textContent = totalSold;
+  globalRateEl.textContent = globalRate.toFixed(1) + " %";
 
-      const onlyAlerts = onlyAlertsCheckbox.checked;
-      const rowsToShow = onlyAlerts ? aggregated.filter(isAlert) : aggregated;
+  // 3) Tableau principal
+  if (!aggregated.length) {
+    tbody.innerHTML =
+      '<tr><td colspan="7" class="empty">Aucune donnée pour cette sélection.</td></tr>';
+    updateAlertSummary(aggregated);
+    updateTop10(aggregated);
+    return;
+  }
 
-      if (!rowsToShow.length) {
-        tbody.innerHTML =
-          '<tr><td colspan="7" class="empty">Aucun produit ne correspond au filtre actuel.</td></tr>';
-        updateAlertSummary(aggregated);
-        updateTop10(aggregated);
-        return;
-      }
+  const onlyAlerts = onlyAlertsCheckbox.checked;
+  const rowsToShow = onlyAlerts ? aggregated.filter(isAlert) : aggregated;
 
-      tbody.innerHTML = "";
-      rowsToShow.forEach((r) => {
-        const tr = document.createElement("tr");
+  if (!rowsToShow.length) {
+    tbody.innerHTML =
+      '<tr><td colspan="7" class="empty">Aucun produit ne correspond au filtre actuel.</td></tr>';
+    updateAlertSummary(aggregated);
+    updateTop10(aggregated);
+    return;
+  }
 
-        const img = r.image || "";
-        const productTitle = r.product_title || "";
-        const base = r.initial_base ?? 0;
-        const extra = r.extra_received ?? 0;
-        const total = r.initial_total ?? (base + extra);
-        const restocks = r.restock_count ?? 0;
-        const sold = r.sold ?? 0;
-        const pct = r.sell_through_pct ?? 0;
-        const alert = isAlert(r);
+  tbody.innerHTML = "";
 
-        const variantInfo =
-          r.variant_count <= 1
-            ? (r.variant_titles[0] || "1 variante")
-            : `${r.variant_count} variantes`;
+  rowsToShow.forEach((productRow) => {
+    const tr = document.createElement("tr");
+    tr.style.cursor = "pointer";
 
-        if (alert) tr.classList.add("row-low");
+    const img = productRow.image || "";
+    const productTitle = productRow.product_title;
+    const variantInfo =
+      productRow.variant_count <= 1
+        ? (productRow.variant_titles[0] || "1 variante")
+        : productRow.variant_count + " variantes";
 
-        tr.innerHTML = `
-          <td>
-            <div class="prod-cell">
+    const base = productRow.initial_base;
+    const extra = productRow.extra_received;
+    const total = productRow.initial_total;
+    const sold = productRow.sold;
+    const pct = productRow.sell_through_pct;
+    const alert = isAlert(productRow);
+
+    if (alert) tr.classList.add("row-low");
+
+    tr.innerHTML = `
+      <td>
+        <div class="prod-cell">
+          ${
+            img
+              ? `<img src="${img}" alt="" class="prod-img" />`
+              : `<div class="prod-img"></div>`
+          }
+          <div>
+            <div class="prod-text-main">
+              ${productTitle}
               ${
-                img
-                  ? `<img src="${img}" alt="" class="prod-img" />`
-                  : `<div class="prod-img"></div>`
+                alert
+                  ? '<span class="alert-tag"><span>⚠️</span><span>Faible sortie</span></span>'
+                  : ""
               }
-              <div>
-                <div class="prod-text-main">
-                  ${productTitle}
-                  ${
-                    alert
-                      ? '<span class="alert-tag"><span>⚠️</span><span>Faible sortie</span></span>'
-                      : ""
-                  }
-                </div>
-                <div class="prod-text-sub">
-                  Base : ${base} · Réassort : ${extra} (${restocks} réassort${restocks > 1 ? "s" : ""})
-                </div>
-              </div>
             </div>
-          </td>
-          <td><span class="chip">${variantInfo}</span></td>
-          <td>${base}</td>
-          <td>${extra}</td>
-          <td>${total}</td>
-          <td>${sold}</td>
-          <td class="pct-cell ${pctClass(pct)}">
-            ${pct.toFixed(1)} % — ${badgeForPct(pct)}
-          </td>
-        `;
+            <div class="prod-text-sub">
+              Base : ${base} · Réassort : ${extra}
+            </div>
+          </div>
+        </div>
+      </td>
+      <td><span class="chip">${variantInfo}</span></td>
+      <td>${base}</td>
+      <td>${extra}</td>
+      <td>${total}</td>
+      <td>${sold}</td>
+      <td class="pct-cell ${pctClass(pct)}">
+        ${pct.toFixed(1)} % — ${badgeForPct(pct)}
+      </td>
+    `;
 
-        tbody.appendChild(tr);
-      });
+    // ⬇️ Gestion du clic pour déplier
+    tr.addEventListener("click", () => {
+      const existing = tr.nextSibling;
+      if (existing && existing.classList && existing.classList.contains("variants-row")) {
+        existing.remove();
+        return;
+      }
 
-      updateAlertSummary(aggregated);
-      updateTop10(aggregated);
-    }
+      const variants = window.allVariantsRaw.filter(
+        (v) => v.product_title === productRow.product_title
+      );
+
+      const detailRow = document.createElement("tr");
+      detailRow.classList.add("variants-row");
+
+      // Style de ligne dépliée
+      detailRow.innerHTML = `
+        <td colspan="7" style="background:#f9fafb; padding:15px 30px;">
+          <div style="font-size:14px; font-weight:600; margin-bottom:10px;">
+            Détail des variantes
+          </div>
+          <table style="width:100%; background:white; border-radius:8px; overflow:hidden;">
+            <thead>
+              <tr style="background:#eef2ff;">
+                <th>Variante</th>
+                <th>Stock base</th>
+                <th>Réassort</th>
+                <th>Stock saison</th>
+                <th>Vendu</th>
+                <th>Taux</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${variants
+                .map((v) => {
+                  const baseV = v.initial_base ?? 0;
+                  const extraV = v.extra_received ?? 0;
+                  const totalV = v.initial_total ?? baseV + extraV;
+                  const soldV = v.sold ?? 0;
+                  const pctV = v.sell_through_pct ?? 0;
+
+                  return `
+                    <tr>
+                      <td>${v.variant_title || "—"}</td>
+                      <td>${baseV}</td>
+                      <td>${extraV}</td>
+                      <td>${totalV}</td>
+                      <td>${soldV}</td>
+                      <td class="${pctClass(pctV)}">${pctV.toFixed(1)} %</td>
+                    </tr>
+                  `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+        </td>
+      `;
+
+      tr.after(detailRow);
+    });
+
+    tbody.appendChild(tr);
+  });
+
+  updateAlertSummary(aggregated);
+  updateTop10(aggregated);
+}
+
 
     async function doSnapshot() {
       const season = seasonInput.value.trim();
