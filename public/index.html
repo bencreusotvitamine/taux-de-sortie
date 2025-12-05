@@ -99,6 +99,7 @@
       gap: 8px;
       margin-top: 8px;
       align-items: center;
+      flex-wrap: wrap;
     }
     .pill {
       display: inline-flex;
@@ -182,15 +183,9 @@
     .pct-cell {
       font-weight: 600;
     }
-    .pct-high {
-      color: #16a34a;
-    }
-    .pct-mid {
-      color: #f97316;
-    }
-    .pct-low {
-      color: #dc2626;
-    }
+    .pct-high { color: #16a34a; }
+    .pct-mid  { color: #f97316; }
+    .pct-low  { color: #dc2626; }
     .row-low {
       background: #fef2f2;
     }
@@ -214,6 +209,9 @@
       color: #9ca3af;
       font-size: 13px;
     }
+    .variants-row td {
+      border-bottom: none !important;
+    }
     @media (max-width: 900px) {
       body { padding: 12px; }
       table { font-size: 12px; }
@@ -225,8 +223,8 @@
 <body>
   <h1>TAUX DE SORTIE</h1>
   <div class="subtitle">
-    Suivi saison par saison (balises Shopify) avec réassorts, ventes, alertes, taux global et Top 10.
-    <br/>📌 Le tableau est maintenant <strong>agrégé par produit</strong> (toutes variantes regroupées).
+    Suivi saison par saison (balises Shopify) avec réassorts, ventes, alertes, taux global, Top 10 meilleures & pires sorties.<br/>
+    📌 1 ligne = 1 produit (toutes variantes regroupées) — clic sur la ligne pour voir le détail des variantes.
   </div>
 
   <!-- 🔧 CONTROLES -->
@@ -234,7 +232,7 @@
     <div class="controls">
       <label>
         Saison / Balises Shopify
-        <input id="season" type="text" placeholder="Ex : FW25, HOMME" />
+        <input id="season" type="text" placeholder="Ex : ADIDAS, HOMME" />
       </label>
       <label>
         Seuil stock alertes
@@ -279,15 +277,13 @@
         <tr>
           <th>Produit</th>
           <th>Variantes</th>
-          <th>Stock base</th>
-          <th>Réassort total</th>
-          <th>Stock saison</th>
+          <th>Stock initial</th>
           <th>Vendu</th>
           <th>Taux</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="7" class="empty">Aucune donnée pour le moment.</td></tr>
+        <tr><td colspan="5" class="empty">Aucune donnée pour le moment.</td></tr>
       </tbody>
     </table>
   </div>
@@ -300,14 +296,32 @@
         <tr>
           <th>#</th>
           <th>Produit</th>
-          <th>Variantes</th>
           <th>Stock saison</th>
           <th>Vendu</th>
           <th>Taux</th>
         </tr>
       </thead>
-      <tbody id="tbodyTop10">
-        <tr><td colspan="6" class="empty">Aucune donnée pour le Top 10.</td></tr>
+      <tbody id="tbodyTopBest">
+        <tr><td colspan="5" class="empty">Aucune donnée pour le Top 10.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 🔻 TOP 10 Pires sorties -->
+  <div class="card">
+    <div class="card-title">Top 10 pires sorties (par produit sur la sélection)</div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Produit</th>
+          <th>Stock saison</th>
+          <th>Vendu</th>
+          <th>Taux</th>
+        </tr>
+      </thead>
+      <tbody id="tbodyTopWorst">
+        <tr><td colspan="5" class="empty">Aucune donnée pour le Top 10.</td></tr>
       </tbody>
     </table>
   </div>
@@ -315,7 +329,8 @@
   <script>
     const statusEl = document.getElementById("status");
     const tbody = document.getElementById("tbody");
-    const tbodyTop10 = document.getElementById("tbodyTop10");
+    const tbodyTopBest = document.getElementById("tbodyTopBest");
+    const tbodyTopWorst = document.getElementById("tbodyTopWorst");
     const seasonInput = document.getElementById("season");
     const snapshotBtn = document.getElementById("snapshotBtn");
     const refreshBtn = document.getElementById("refreshBtn");
@@ -327,7 +342,9 @@
     const globalSoldEl = document.getElementById("globalSold");
     const globalRateEl = document.getElementById("globalRate");
 
-    let lastRows = []; // agrégés par produit
+    let lastProducts = [];
+    let lastTopBest = [];
+    let lastTopWorst = [];
 
     function setStatus(msg) {
       statusEl.textContent = msg || "";
@@ -353,78 +370,11 @@
       return "❄️ Faible";
     }
 
-    // Agrégation par produit (toutes variantes regroupées)
-    function aggregateByProduct(rows) {
-      const map = new Map();
-
-      rows.forEach((r) => {
-        const key = r.product_title || "Produit sans nom";
-        let agg = map.get(key);
-        if (!agg) {
-          agg = {
-            product_title: key,
-            image: r.image || null,
-            variant_titles: new Set(),
-            variant_count: 0,
-            initial_base: 0,
-            extra_received: 0,
-            initial_total: 0,
-            restock_count: 0,
-            sold: 0,
-          };
-          map.set(key, agg);
-        }
-
-        const base = r.initial_base ?? 0;
-        const extra = r.extra_received ?? 0;
-        const total = r.initial_total ?? (base + extra);
-        const restocks = r.restock_count ?? 0;
-        const sold = r.sold ?? 0;
-
-        agg.initial_base += base;
-        agg.extra_received += extra;
-        agg.initial_total += total;
-        agg.restock_count += restocks;
-        agg.sold += sold;
-
-        if (r.image && !agg.image) agg.image = r.image;
-        if (r.variant_title) {
-          if (!agg.variant_titles.has(r.variant_title)) {
-            agg.variant_titles.add(r.variant_title);
-            agg.variant_count++;
-          }
-        }
-      });
-
-      const result = Array.from(map.values()).map((agg) => {
-        const total = agg.initial_total;
-        const pct = total > 0 ? (agg.sold / total) * 100 : 0;
-        return {
-          product_title: agg.product_title,
-          image: agg.image,
-          variant_titles: Array.from(agg.variant_titles),
-          variant_count: agg.variant_count,
-          initial_base: agg.initial_base,
-          extra_received: agg.extra_received,
-          initial_total: agg.initial_total,
-          restock_count: agg.restock_count,
-          sold: agg.sold,
-          sell_through_pct: Number(pct.toFixed(1)),
-        };
-      });
-
-      // tri alpha par produit
-      result.sort((a, b) => a.product_title.localeCompare(b.product_title));
-      return result;
-    }
-
-    // ⚠️ Règle d'alerte
-    function isAlert(row) {
-      const base = row.initial_base ?? 0;
-      const extra = row.extra_received ?? 0;
-      const total = row.initial_total ?? (base + extra);
-      const sold = row.sold ?? 0;
-      const pct = row.sell_through_pct ?? 0;
+    // Alerte produit : stock initial >= seuil, et (0 vendu ou taux < 20 %)
+    function isAlert(productRow) {
+      const total = productRow.initial || 0;
+      const sold = productRow.sold || 0;
+      const pct = productRow.sell_through_pct ?? 0;
       const minStock = getMinStockAlert();
 
       if (total < minStock) return false;
@@ -433,9 +383,9 @@
       return false;
     }
 
-    function updateAlertSummary(rows) {
-      const alertRows = rows.filter(isAlert);
-      if (!rows.length || !alertRows.length) {
+    function updateAlertSummary(products) {
+      const alertRows = products.filter(isAlert);
+      if (!products.length || !alertRows.length) {
         alertSummary.style.display = "none";
         return;
       }
@@ -445,227 +395,215 @@
         n === 1 ? "1 produit en alerte" : n + " produits en alerte";
     }
 
-    // ⭐ Top 10 par produit
-    function updateTop10(rows) {
-      if (!rows || !rows.length) {
-        tbodyTop10.innerHTML =
-          '<tr><td colspan="6" class="empty">Aucune donnée pour le Top 10.</td></tr>';
+    function renderTopBest(list) {
+      if (!list || !list.length) {
+        tbodyTopBest.innerHTML =
+          '<tr><td colspan="5" class="empty">Aucune donnée pour le Top 10.</td></tr>';
         return;
       }
-
-      const filtered = rows
-        .map((r) => {
-          const base = r.initial_base ?? 0;
-          const extra = r.extra_received ?? 0;
-          const total = r.initial_total ?? (base + extra);
-          const sold = r.sold ?? 0;
-          const pct = r.sell_through_pct ?? 0;
-          return { ...r, _total: total, _sold: sold, _pct: pct };
-        })
-        .filter((r) => r._total > 0 && r._sold > 0);
-
-      if (!filtered.length) {
-        tbodyTop10.innerHTML =
-          '<tr><td colspan="6" class="empty">Aucune donnée pour le Top 10.</td></tr>';
-        return;
-      }
-
-      filtered.sort((a, b) => b._pct - a._pct);
-      const top = filtered.slice(0, 10);
-
-      tbodyTop10.innerHTML = "";
-      top.forEach((r, index) => {
-        const variantInfo =
-          r.variant_count <= 1
-            ? (r.variant_titles[0] || "1 variante")
-            : `${r.variant_count} variantes`;
-
+      tbodyTopBest.innerHTML = "";
+      list.forEach((p, index) => {
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td>${index + 1}</td>
-          <td>${r.product_title || ""}</td>
-          <td><span class="chip">${variantInfo}</span></td>
-          <td>${r._total}</td>
-          <td>${r._sold}</td>
-          <td class="pct-cell ${pctClass(r._pct)}">
-            ${r._pct.toFixed(1)} % — ${badgeForPct(r._pct)}
+          <td>${p.title || ""}</td>
+          <td>${p.initial || 0}</td>
+          <td>${p.sold || 0}</td>
+          <td class="pct-cell ${pctClass(p.sell_through_pct || 0)}">
+            ${(p.sell_through_pct ?? 0).toFixed(1)} % — ${badgeForPct(p.sell_through_pct ?? 0)}
           </td>
         `;
-        tbodyTop10.appendChild(tr);
+        tbodyTopBest.appendChild(tr);
       });
     }
 
-function renderRows(variantRowsFromServer) {
-  // Garder toutes les variantes d'origine pour les détails
-  window.allVariantsRaw = variantRowsFromServer || [];
+    function renderTopWorst(list) {
+      if (!list || !list.length) {
+        tbodyTopWorst.innerHTML =
+          '<tr><td colspan="5" class="empty">Aucune donnée pour le Top 10.</td></tr>';
+        return;
+      }
+      tbodyTopWorst.innerHTML = "";
+      list.forEach((p, index) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${index + 1}</td>
+          <td>${p.title || ""}</td>
+          <td>${p.initial || 0}</td>
+          <td>${p.sold || 0}</td>
+          <td class="pct-cell ${pctClass(p.sell_through_pct || 0)}">
+            ${(p.sell_through_pct ?? 0).toFixed(1)} % — ${badgeForPct(p.sell_through_pct ?? 0)}
+          </td>
+        `;
+        tbodyTopWorst.appendChild(tr);
+      });
+    }
 
-  // 1) Agrégation par produit
-  const aggregated = aggregateByProduct(window.allVariantsRaw);
-  lastRows = aggregated;
+    function renderProducts(products) {
+      lastProducts = products || [];
 
-  // 2) Stats globales
-  let totalStock = 0;
-  let totalSold = 0;
+      // Stats globales
+      let totalStock = 0;
+      let totalSold = 0;
+      products.forEach((p) => {
+        totalStock += p.initial || 0;
+        totalSold += p.sold || 0;
+      });
+      const globalRate = totalStock > 0 ? (totalSold / totalStock) * 100 : 0;
+      globalStockEl.textContent = totalStock;
+      globalSoldEl.textContent = totalSold;
+      globalRateEl.textContent = globalRate.toFixed(1) + " %";
 
-  aggregated.forEach((r) => {
-    const total = r.initial_total ?? (r.initial_base + r.extra_received);
-    totalStock += total;
-    totalSold += r.sold ?? 0;
-  });
-
-  const globalRate = totalStock > 0 ? (totalSold / totalStock) * 100 : 0;
-  globalStockEl.textContent = totalStock;
-  globalSoldEl.textContent = totalSold;
-  globalRateEl.textContent = globalRate.toFixed(1) + " %";
-
-  // 3) Tableau principal
-  if (!aggregated.length) {
-    tbody.innerHTML =
-      '<tr><td colspan="7" class="empty">Aucune donnée pour cette sélection.</td></tr>';
-    updateAlertSummary(aggregated);
-    updateTop10(aggregated);
-    return;
-  }
-
-  const onlyAlerts = onlyAlertsCheckbox.checked;
-  const rowsToShow = onlyAlerts ? aggregated.filter(isAlert) : aggregated;
-
-  if (!rowsToShow.length) {
-    tbody.innerHTML =
-      '<tr><td colspan="7" class="empty">Aucun produit ne correspond au filtre actuel.</td></tr>';
-    updateAlertSummary(aggregated);
-    updateTop10(aggregated);
-    return;
-  }
-
-  tbody.innerHTML = "";
-
-  rowsToShow.forEach((productRow) => {
-    const tr = document.createElement("tr");
-    tr.style.cursor = "pointer";
-
-    const img = productRow.image || "";
-    const productTitle = productRow.product_title;
-    const variantInfo =
-      productRow.variant_count <= 1
-        ? (productRow.variant_titles[0] || "1 variante")
-        : productRow.variant_count + " variantes";
-
-    const base = productRow.initial_base;
-    const extra = productRow.extra_received;
-    const total = productRow.initial_total;
-    const sold = productRow.sold;
-    const pct = productRow.sell_through_pct;
-    const alert = isAlert(productRow);
-
-    if (alert) tr.classList.add("row-low");
-
-    tr.innerHTML = `
-      <td>
-        <div class="prod-cell">
-          ${
-            img
-              ? `<img src="${img}" alt="" class="prod-img" />`
-              : `<div class="prod-img"></div>`
-          }
-          <div>
-            <div class="prod-text-main">
-              ${productTitle}
-              ${
-                alert
-                  ? '<span class="alert-tag"><span>⚠️</span><span>Faible sortie</span></span>'
-                  : ""
-              }
-            </div>
-            <div class="prod-text-sub">
-              Base : ${base} · Réassort : ${extra}
-            </div>
-          </div>
-        </div>
-      </td>
-      <td><span class="chip">${variantInfo}</span></td>
-      <td>${base}</td>
-      <td>${extra}</td>
-      <td>${total}</td>
-      <td>${sold}</td>
-      <td class="pct-cell ${pctClass(pct)}">
-        ${pct.toFixed(1)} % — ${badgeForPct(pct)}
-      </td>
-    `;
-
-    // ⬇️ Gestion du clic pour déplier
-    tr.addEventListener("click", () => {
-      const existing = tr.nextSibling;
-      if (existing && existing.classList && existing.classList.contains("variants-row")) {
-        existing.remove();
+      if (!products.length) {
+        tbody.innerHTML =
+          '<tr><td colspan="5" class="empty">Aucune donnée pour cette sélection.</td></tr>';
+        updateAlertSummary(products);
         return;
       }
 
-      const variants = window.allVariantsRaw.filter(
-        (v) => v.product_title === productRow.product_title
-      );
+      const onlyAlerts = onlyAlertsCheckbox.checked;
+      const rowsToShow = onlyAlerts
+        ? products.filter(isAlert)
+        : products.slice().sort((a, b) =>
+            (a.title || "").localeCompare(b.title || "")
+          );
 
-      const detailRow = document.createElement("tr");
-      detailRow.classList.add("variants-row");
+      if (!rowsToShow.length) {
+        tbody.innerHTML =
+          '<tr><td colspan="5" class="empty">Aucun produit ne correspond au filtre actuel.</td></tr>';
+        updateAlertSummary(products);
+        return;
+      }
 
-      // Style de ligne dépliée
-      detailRow.innerHTML = `
-        <td colspan="7" style="background:#f9fafb; padding:15px 30px;">
-          <div style="font-size:14px; font-weight:600; margin-bottom:10px;">
-            Détail des variantes
-          </div>
-          <table style="width:100%; background:white; border-radius:8px; overflow:hidden;">
-            <thead>
-              <tr style="background:#eef2ff;">
-                <th>Variante</th>
-                <th>Stock base</th>
-                <th>Réassort</th>
-                <th>Stock saison</th>
-                <th>Vendu</th>
-                <th>Taux</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${variants
-                .map((v) => {
-                  const baseV = v.initial_base ?? 0;
-                  const extraV = v.extra_received ?? 0;
-                  const totalV = v.initial_total ?? baseV + extraV;
-                  const soldV = v.sold ?? 0;
-                  const pctV = v.sell_through_pct ?? 0;
+      tbody.innerHTML = "";
 
-                  return `
-                    <tr>
-                      <td>${v.variant_title || "—"}</td>
-                      <td>${baseV}</td>
-                      <td>${extraV}</td>
-                      <td>${totalV}</td>
-                      <td>${soldV}</td>
-                      <td class="${pctClass(pctV)}">${pctV.toFixed(1)} %</td>
-                    </tr>
-                  `;
-                })
-                .join("")}
-            </tbody>
-          </table>
-        </td>
-      `;
+      rowsToShow.forEach((p) => {
+        const tr = document.createElement("tr");
+        tr.style.cursor = "pointer";
 
-      tr.after(detailRow);
-    });
+        const img = p.image_src || "";
+        const productTitle = p.title || "";
+        const variantCount = (p.variants && p.variants.length) || 0;
+        const variantLabel =
+          variantCount <= 1
+            ? (variantCount === 0 ? "—" : "1 variante")
+            : `${variantCount} variantes`;
 
-    tbody.appendChild(tr);
-  });
+        const total = p.initial || 0;
+        const sold = p.sold || 0;
+        const pct = p.sell_through_pct ?? 0;
+        const alert = isAlert(p);
 
-  updateAlertSummary(aggregated);
-  updateTop10(aggregated);
-}
+        if (alert) tr.classList.add("row-low");
 
+        tr.innerHTML = `
+          <td>
+            <div class="prod-cell">
+              ${
+                img
+                  ? `<img src="${img}" alt="" class="prod-img" />`
+                  : `<div class="prod-img"></div>`
+              }
+              <div>
+                <div class="prod-text-main">
+                  ${productTitle}
+                  ${
+                    alert
+                      ? '<span class="alert-tag"><span>⚠️</span><span>Faible sortie</span></span>'
+                      : ""
+                  }
+                </div>
+                <div class="prod-text-sub">
+                  Cliquez pour voir le détail des variantes
+                </div>
+              </div>
+            </div>
+          </td>
+          <td><span class="chip">${variantLabel}</span></td>
+          <td>${total}</td>
+          <td>${sold}</td>
+          <td class="pct-cell ${pctClass(pct)}">
+            ${pct.toFixed(1)} % — ${badgeForPct(pct)}
+          </td>
+        `;
+
+        // Gestion du clic pour déplier / replier les variantes
+        tr.addEventListener("click", () => {
+          const existing = tr.nextSibling;
+          if (existing && existing.classList && existing.classList.contains("variants-row")) {
+            existing.remove();
+            return;
+          }
+
+          const variants = p.variants || [];
+
+          const detailRow = document.createElement("tr");
+          detailRow.classList.add("variants-row");
+          detailRow.innerHTML = `
+            <td colspan="5" style="background:#f9fafb; padding:15px 30px;">
+              <div style="font-size:14px; font-weight:600; margin-bottom:10px;">
+                Détail des variantes
+              </div>
+              <table style="width:100%; background:white; border-radius:8px; overflow:hidden;">
+                <thead>
+                  <tr style="background:#eef2ff;">
+                    <th>Variante</th>
+                    <th>Stock initial</th>
+                    <th>Vendu</th>
+                    <th>Taux</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${
+                    variants.length
+                      ? variants
+                          .map((v) => {
+                            const baseV = v.initial || 0;
+                            const soldV = v.sold || 0;
+                            const pctV = v.sell_through_pct ?? 0;
+                            return `
+                              <tr>
+                                <td>${v.title || "—"}</td>
+                                <td>${baseV}</td>
+                                <td>${soldV}</td>
+                                <td class="${pctClass(pctV)}">${pctV.toFixed(1)} %</td>
+                              </tr>
+                            `;
+                          })
+                          .join("")
+                      : `<tr><td colspan="4" class="empty">Aucune variante détaillée.</td></tr>`
+                  }
+                </tbody>
+              </table>
+            </td>
+          `;
+          tr.after(detailRow);
+        });
+
+        tbody.appendChild(tr);
+      });
+
+      updateAlertSummary(products);
+    }
+
+    function renderAll(data) {
+      const products = data.products || [];
+      const topBest = data.topBest10 || [];
+      const topWorst = data.topWorst10 || [];
+
+      lastProducts = products;
+      lastTopBest = topBest;
+      lastTopWorst = topWorst;
+
+      renderProducts(products);
+      renderTopBest(topBest);
+      renderTopWorst(topWorst);
+    }
 
     async function doSnapshot() {
       const season = seasonInput.value.trim();
       if (!season) {
-        alert("Merci de saisir au moins une balise (ex: FW25, HOMME).");
+        alert("Merci de saisir au moins une balise / saison (ex: ADIDAS, HOMME).");
         return;
       }
 
@@ -685,7 +623,13 @@ function renderRows(variantRowsFromServer) {
           console.error(json);
           setStatus("❌ Erreur snapshot : " + (json.error || "inconnue"));
         } else {
-          setStatus("✅ Stock de départ mis à jour pour " + season + " (" + json.inserted + " variantes).");
+          setStatus(
+            "✅ Stock de départ mis à jour pour " +
+              season +
+              " (" +
+              json.inserted +
+              " variantes)."
+          );
           await refresh();
         }
       } catch (e) {
@@ -707,10 +651,21 @@ function renderRows(variantRowsFromServer) {
       setStatus("🔄 Chargement des données…");
 
       try {
-        const res = await fetch("/api/sellthrough?season=" + encodeURIComponent(season));
+        // on envoie season à la fois comme saison (pour la DB) et comme tags (pour le filtre produits Shopify)
+        const url =
+          "/api/sellthrough?season=" +
+          encodeURIComponent(season) +
+          "&tags=" +
+          encodeURIComponent(season);
+
+        const res = await fetch(url);
         const data = await res.json();
-        renderRows(data);
-        setStatus("✅ Données mises à jour (" + data.length + " variantes avant agrégation).");
+        renderAll(data);
+        setStatus(
+          "✅ Données mises à jour (" +
+            (data.products ? data.products.length : 0) +
+            " produits)."
+        );
       } catch (e) {
         console.error(e);
         setStatus("❌ Erreur lors du chargement des données.");
@@ -719,8 +674,8 @@ function renderRows(variantRowsFromServer) {
 
     snapshotBtn.addEventListener("click", doSnapshot);
     refreshBtn.addEventListener("click", refresh);
-    onlyAlertsCheckbox.addEventListener("change", () => renderRows(lastRows));
-    minStockAlertInput.addEventListener("change", () => renderRows(lastRows));
+    onlyAlertsCheckbox.addEventListener("change", () => renderProducts(lastProducts));
+    minStockAlertInput.addEventListener("change", () => renderProducts(lastProducts));
   </script>
 </body>
 </html>
