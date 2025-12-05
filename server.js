@@ -1,3 +1,5 @@
+// server.js – TAUX DE SORTIE (version complète avec Top 10 best + worst)
+
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
@@ -7,58 +9,7 @@ import { fileURLToPath } from "url";
 import { initDb, db } from "./db.js";
 
 dotenv.config();
-
-/* -------------------------------------------------------------------------- */
-/* 🔧 DB : s'assurer que les colonnes existent                                */
-/* -------------------------------------------------------------------------- */
-
-async function ensureSchema() {
-  async function addColumnIfMissing(table, column, type) {
-    try {
-      await db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-      console.log(`✅ Colonne ajoutée : ${table}.${column}`);
-    } catch (e) {
-      if (e.message?.includes("duplicate column name")) {
-        console.log(`ℹ️ Colonne déjà présente : ${table}.${column}`);
-      } else {
-        console.warn(`⚠️ Problème ajout colonne ${table}.${column} :`, e.message);
-      }
-    }
-  }
-
-  // Pour l'écran
-  await addColumnIfMissing("initial_stock", "product_title", "TEXT");
-  await addColumnIfMissing("initial_stock", "variant_title", "TEXT");
-  await addColumnIfMissing("initial_stock", "image", "TEXT");
-  await addColumnIfMissing("initial_stock", "inventory_item_id", "INTEGER");
-
-  // Pour suivre les réceptions (delta)
-  await addColumnIfMissing("inventory_changes", "delta", "INTEGER");
-}
-
 await initDb();
-await ensureSchema();
-
-/* -------------------------------------------------------------------------- */
-/* 📦 Config Shopify                                                          */
-/* -------------------------------------------------------------------------- */
-
-const RAW_SHOP_NAME = (process.env.SHOP_NAME || "").trim();
-const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
-const API_VERSION = process.env.API_VERSION || "2024-10";
-
-let SHOP_DOMAIN = RAW_SHOP_NAME
-  .replace(/^https?:\/\//, "")
-  .replace(/\/admin.*$/i, "")
-  .replace(/\/$/, "");
-
-if (!SHOP_DOMAIN.includes(".")) SHOP_DOMAIN = `${SHOP_DOMAIN}.myshopify.com`;
-
-console.log("🛍️ Shopify domain utilisé :", SHOP_DOMAIN);
-
-/* -------------------------------------------------------------------------- */
-/* 🌐 App Express                                                             */
-/* -------------------------------------------------------------------------- */
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -67,438 +18,345 @@ const app = express();
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-/* -------------------------------------------------------------------------- */
-/* 🔁 Utilitaires Shopify                                                     */
-/* -------------------------------------------------------------------------- */
+const SHOP_NAME = process.env.SHOP_NAME; // ex: vitamine-clubfr.myshopify.com
+const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+const API_VERSION = process.env.API_VERSION || "2024-10";
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+if (!SHOP_NAME || !ADMIN_API_TOKEN) {
+  console.warn("⚠️ SHOP_NAME ou ADMIN_API_TOKEN non définis dans l'environnement.");
 }
 
-// Réponse complète (data + headers)
-async function shopifyGetRaw(pathUrl, params = {}, retry = 0) {
-  const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/${pathUrl}`;
-  console.log("➡️ Shopify GET (raw) :", url, params);
-
-  try {
-    const res = await axios.get(url, {
-      headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
-      params,
-    });
-    return res;
-  } catch (err) {
-    const status = err?.response?.status;
-    if (status === 429 && retry < 5) {
-      const retryAfter = Number(err.response.headers["retry-after"] || 2);
-      console.log(`⚠️ 429 Too Many Requests → Attente ${retryAfter}s`);
-      await sleep(retryAfter * 1000 + 300);
-      return shopifyGetRaw(pathUrl, params, retry + 1);
-    }
-    console.error("❌ Shopify error (raw)", status, err.response?.data || err.message);
-    throw err;
-  }
-}
-
-// Version simple (juste data)
-async function shopifyGet(pathUrl, params = {}, retry = 0) {
-  const res = await shopifyGetRaw(pathUrl, params, retry);
+// ----------------------------
+// Utilitaire Shopify REST
+// ----------------------------
+async function shopifyGet(pathUrl, params = {}) {
+  const url = `https://${SHOP_NAME}/admin/api/${API_VERSION}/${pathUrl}`;
+  console.log("➡️ Appel Shopify :", url);
+  const res = await axios.get(url, {
+    headers: {
+      "X-Shopify-Access-Token": ADMIN_API_TOKEN,
+      "Content-Type": "application/json",
+    },
+    params,
+  });
   return res.data;
 }
 
-function chunkArray(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) {
-    out.push(arr.slice(i, i + size));
-  }
-  return out;
-}
+// ----------------------------
+// PAGE FRONT (Dashboard)
+// ----------------------------
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
 
-/* -------------------------------------------------------------------------- */
-/* 📥 Récupère TOUS les produits qui ont TOUTES les balises demandées        */
-/* -------------------------------------------------------------------------- */
-
-async function fetchProductsByTags(tagsArray) {
-  const requiredTags = tagsArray
-    .map((t) => t.trim().toLowerCase())
-    .filter(Boolean);
-
-  if (!requiredTags.length) {
-    console.log("⚠️ fetchProductsByTags appelé sans tags utiles");
-    return [];
-  }
-
-  let results = [];
-  let pageInfo = null;
-
-  while (true) {
-    let params;
-    if (!pageInfo) {
-      params = {
-        limit: 250,
-        fields: "id,title,tags,variants,images",
-      };
-    } else {
-      params = {
-        limit: 250,
-        page_info: pageInfo,
-      };
-    }
-
-    const res = await shopifyGetRaw("products.json", params);
-    const products = res.data.products || [];
-
-    if (!products.length) break;
-
-    for (const p of products) {
-      if (!p.tags) continue;
-
-      const tags = p.tags
-        .split(",")
-        .map((t) => t.trim().toLowerCase());
-
-      // produit retenu seulement s'il a TOUTES les balises
-      const hasAll = requiredTags.every((rt) => tags.includes(rt));
-      if (hasAll) results.push(p);
-    }
-
-    const linkHeader = res.headers["link"] || res.headers["Link"];
-    if (!linkHeader || !linkHeader.includes('rel="next"')) break;
-
-    const match = linkHeader.match(/<[^>]*page_info=([^&>]+)[^>]*>; rel="next"/);
-    if (!match) break;
-    pageInfo = match[1];
-  }
-
-  console.log(
-    `📦 fetchProductsByTags(${requiredTags.join(" & ")}) → ${results.length} produits`
-  );
-  return results;
-}
-
-/* -------------------------------------------------------------------------- */
-/* 📸 SNAPSHOT : définit la liste de variantes + stock base (une seule fois) */
-/* -------------------------------------------------------------------------- */
-
+// ----------------------------
+// 1) Snapshot du stock de départ
+// ----------------------------
+//
+// On prend un "instantané" des stocks actuels par variante
+// et on les enregistre dans la table initial_stock pour une saison donnée.
+//
 app.post("/api/initial_stock/snapshot", async (req, res) => {
   try {
     const { season } = req.body;
-    if (!season) return res.status(400).json({ error: "season required" });
-
-    const rawSeason = season.trim();
-    const tagParts = rawSeason.split(/[;,]/).map((t) => t.trim()).filter(Boolean);
-
-    if (!tagParts.length) {
-      return res.status(400).json({ error: "no valid tags in season field" });
+    if (!season) {
+      return res.status(400).json({ error: "season required" });
     }
 
-    console.log("📌 Snapshot pour les balises :", tagParts.join(" & "));
+    // 1. Récupérer les produits (limite 250 pour rester simple)
+    const productsData = await shopifyGet("products.json", { limit: 250 });
+    const products = productsData.products || productsData || [];
 
-    // 1) Tous les produits qui matchent TOUTES ces balises
-    const taggedProducts = await fetchProductsByTags(tagParts);
+    const rowsToInsert = [];
 
-    console.log(
-      `📦 ${taggedProducts.length} produits avec toutes les balises [${tagParts.join(
-        ", "
-      )}]`
-    );
-
-    // 2) Variantes + inventory_item_id
-    const variantMeta = [];
-    const inventoryItemIdsSet = new Set();
-
-    for (const p of taggedProducts) {
-      const image = p.images?.[0]?.src || null;
-
-      for (const v of p.variants || []) {
-        variantMeta.push({
-          variant_id: v.id,
-          inventory_item_id: v.inventory_item_id,
-          product_title: p.title,
-          variant_title: v.title,
-          image,
+    // 2. Pour chaque variante, on récupère son stock via inventory_levels
+    for (const p of products) {
+      for (const v of p.variants) {
+        const invData = await shopifyGet("inventory_levels.json", {
+          inventory_item_ids: v.inventory_item_id,
         });
 
-        if (v.inventory_item_id)
-          inventoryItemIdsSet.add(v.inventory_item_id);
+        let qty = 0;
+        if (
+          invData &&
+          invData.inventory_levels &&
+          Array.isArray(invData.inventory_levels)
+        ) {
+          for (const lvl of invData.inventory_levels) {
+            qty += lvl.available || 0;
+          }
+        }
+
+        rowsToInsert.push({
+          variant_id: v.id,
+          sku: v.sku || null,
+          initial_qty: qty,
+          season,
+          product_id: p.id,
+          product_title: p.title,
+          product_handle: p.handle,
+          product_type: p.product_type || null,
+          product_tags: p.tags || "",
+          image_src: p.image?.src || null,
+          variant_title: v.title || null,
+        });
       }
     }
 
-    const inventoryItemIds = Array.from(inventoryItemIdsSet);
-
-    console.log(
-      `🧮 Total variantes : ${variantMeta.length}, inventory_item_ids uniques : ${inventoryItemIds.length}`
-    );
-
-    // 3) Récupérer le stock dispo actuel par inventory_item_id
-    const inventoryMap = new Map();
-    const chunks = chunkArray(inventoryItemIds, 40);
-
-    for (let i = 0; i < chunks.length; i++) {
-      console.log(`📡 Lecture inventaire chunk ${i + 1}/${chunks.length}`);
-
-      const data = await shopifyGet("inventory_levels.json", {
-        inventory_item_ids: chunks[i].join(","),
-        limit: 250,
-      });
-
-      const levels = data.inventory_levels || [];
-      for (const lvl of levels) {
-        const id = lvl.inventory_item_id;
-        const current = inventoryMap.get(id) || 0;
-        inventoryMap.set(id, current + (lvl.available || 0));
-      }
-
-      if (i + 1 < chunks.length) await sleep(600);
-    }
-
-    // 4) Pour chaque variante : soit on crée la ligne, soit on laisse le stock base existant
-    const nowIso = new Date().toISOString();
-
-    for (const v of variantMeta) {
-      const baseQty = inventoryMap.get(v.inventory_item_id) || 0;
-
-      const existing = await db.get(
-        `SELECT * FROM initial_stock WHERE variant_id = ? AND season = ?`,
-        [v.variant_id, rawSeason]
-      );
-
-      if (!existing) {
-        // première fois pour cette saison/variante → on fixe le stock base
-        await db.run(
-          `INSERT INTO initial_stock
-           (variant_id, product_title, variant_title, image, inventory_item_id, initial_qty, season, snapshot_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            v.variant_id,
-            v.product_title,
-            v.variant_title,
-            v.image,
-            v.inventory_item_id,
-            baseQty,
-            rawSeason,
-            nowIso,
-          ]
-        );
-      } else {
-        // déjà existant : on met à jour texte/image/mapping, mais PAS le stock base ni la date
-        await db.run(
-          `UPDATE initial_stock
-           SET product_title = ?, variant_title = ?, image = ?, inventory_item_id = ?
-           WHERE variant_id = ? AND season = ?`,
-          [
-            v.product_title,
-            v.variant_title,
-            v.image,
-            v.inventory_item_id,
-            v.variant_id,
-            rawSeason,
-          ]
-        );
-      }
-    }
-
-    console.log("✅ Snapshot terminé.");
-    res.json({ success: true, inserted: variantMeta.length });
-  } catch (e) {
-    console.error("❌ snapshot error", e);
-    res.status(500).json({ error: "snapshot failed" });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/* 📥 IMPORT MANUEL (optionnel)                                              */
-/* -------------------------------------------------------------------------- */
-
-app.post("/api/initial_stock/import", async (req, res) => {
-  try {
-    const { season, items } = req.body;
-    if (!season || !items)
-      return res.status(400).json({ error: "season + items required" });
-
-    await Promise.all(
-      items.map((i) =>
-        db.run(
-          `REPLACE INTO initial_stock 
-           (variant_id, product_title, variant_title, image, inventory_item_id, initial_qty, season, snapshot_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            i.variant_id,
-            i.product_title || null,
-            i.variant_title || null,
-            i.image || null,
-            i.inventory_item_id || null,
-            i.initial_qty || 0,
-            season,
-            new Date().toISOString(),
-          ]
-        )
-      )
-    );
-
-    res.json({ success: true, inserted: items.length });
-  } catch (e) {
-    console.error("❌ import error", e);
-    res.status(500).json({ error: "import failed" });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/* 🧾 Webhook : orders_create → enregistre les ventes                         */
-/* -------------------------------------------------------------------------- */
-
-app.post("/webhooks/orders_create", async (req, res) => {
-  try {
-    const order = req.body;
-
-    if (!order?.line_items) return res.status(400).end();
-
-    const ops = order.line_items.map((line) =>
+    // 3. Enregistrer dans SQLite
+    const insertPromises = rowsToInsert.map((r) =>
       db.run(
-        `INSERT INTO sales (variant_id, sku, qty, order_id, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
+        `
+        REPLACE INTO initial_stock (
+          variant_id,
+          sku,
+          initial_qty,
+          season,
+          snapshot_at,
+          product_id,
+          product_title,
+          product_handle,
+          product_type,
+          product_tags,
+          image_src,
+          variant_title
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
         [
-          line.variant_id || null,
-          line.sku || null,
-          line.quantity || 0,
-          order.id,
-          order.created_at,
+          r.variant_id,
+          r.sku,
+          r.initial_qty,
+          r.season,
+          new Date().toISOString(),
+          r.product_id,
+          r.product_title,
+          r.product_handle,
+          r.product_type,
+          r.product_tags,
+          r.image_src,
+          r.variant_title,
         ]
       )
     );
 
+    await Promise.all(insertPromises);
+
+    res.json({
+      success: true,
+      inserted: rowsToInsert.length,
+    });
+  } catch (err) {
+    console.error("❌ snapshot error", err);
+    res.status(500).json({ error: "snapshot failed" });
+  }
+});
+
+// ----------------------------
+// 2) Webhook Orders (ventes)
+// ----------------------------
+app.post("/webhooks/orders_create", async (req, res) => {
+  try {
+    const order = req.body;
+    if (!order || !order.line_items) return res.status(400).end();
+
+    const ops = [];
+    for (const line of order.line_items) {
+      ops.push(
+        db.run(
+          `INSERT INTO sales (variant_id, sku, qty, order_id, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            line.variant_id || null,
+            line.sku || null,
+            line.quantity || 0,
+            order.id,
+            order.created_at,
+          ]
+        )
+      );
+    }
+
     await Promise.all(ops);
     res.json({ success: true });
-  } catch (e) {
-    console.error("❌ orders_create webhook error", e);
+  } catch (err) {
+    console.error("❌ order webhook error", err);
     res.status(500).json({ error: "webhook failed" });
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/* 📦 Webhook : inventory_levels_update → suit les variations de stock       */
-/* -------------------------------------------------------------------------- */
-
-app.post("/webhooks/inventory_levels_update", async (req, res) => {
-  try {
-    const p = req.body;
-
-    const inventory_item_id = p.inventory_item_id || null;
-    const location_id = p.location_id || null;
-    const available = p.available || 0;
-    const nowIso = new Date().toISOString();
-
-    // On récupère la dernière valeur connue pour calculer le delta
-    const last = await db.get(
-      `SELECT available FROM inventory_changes
-       WHERE inventory_item_id = ? AND location_id = ?
-       ORDER BY recorded_at DESC
-       LIMIT 1`,
-      [inventory_item_id, location_id]
-    );
-
-    let delta = 0;
-    if (last && typeof last.available === "number") {
-      delta = available - last.available;
-    } else {
-      // premier enregistrement → on met delta = 0 (on ne sait pas l'historique avant)
-      delta = 0;
-    }
-
-    await db.run(
-      `INSERT INTO inventory_changes
-       (inventory_item_id, location_id, available, delta, recorded_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [inventory_item_id, location_id, available, delta, nowIso]
-    );
-
-    res.json({ success: true });
-  } catch (e) {
-    console.error("❌ inventory webhook error", e);
-    res.status(500).json({ error: "inventory webhook failed" });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/* 📊 API SELL-THROUGH : base + réassorts + vendu + taux                      */
-/* -------------------------------------------------------------------------- */
-
+// ----------------------------
+// 3) Sell-through (taux de sortie)
+// ----------------------------
+//
+// Retourne :
+//  - products : tableau des produits agrégés (regroupe toutes les variantes)
+//  - topBest10 : top 10 meilleures sorties
+//  - topWorst10 : top 10 pires sorties
+//
 app.get("/api/sellthrough", async (req, res) => {
   try {
-    const { season } = req.query;
-    if (!season) return res.status(400).json({ error: "season required" });
+    const { season, tags } = req.query;
 
-    // 1) On récupère la photo de base (initial_stock) pour cette "saison"
-    const initial = await db.all(
+    if (!season) {
+      return res.status(400).json({ error: "season param required" });
+    }
+
+    // Liste des balises à filtrer (séparées par virgule)
+    const tagList =
+      tags
+        ?.split(",")
+        .map((t) => t.trim().toLowerCase())
+        .filter(Boolean) || [];
+
+    // 1. Récupérer le stock de départ pour la saison
+    const initialRows = await db.all(
       `SELECT * FROM initial_stock WHERE season = ?`,
       [season]
     );
 
-    if (!initial.length) {
-      return res.json([]);
-    }
-
-    // 2) On récupère toutes les ventes (sales) groupées par variant_id
-    const sales = await db.all(
-      `SELECT variant_id, SUM(qty) AS sold FROM sales GROUP BY variant_id`
-    );
-
-    const soldMap = new Map(sales.map((s) => [String(s.variant_id), s.sold]));
-
-    // 3) Pour chaque variante : base, réassorts, total, vendu, taux
-    const results = [];
-
-    for (const i of initial) {
-      const sold = soldMap.get(String(i.variant_id)) || 0;
-
-      const base = i.initial_qty || 0;
-      let extraReceived = 0;
-      let restockCount = 0;
-
-      if (i.inventory_item_id && i.snapshot_at) {
-        const rows = await db.all(
-          `SELECT delta FROM inventory_changes
-           WHERE inventory_item_id = ?
-             AND recorded_at >= ?
-             AND delta > 0`,
-          [i.inventory_item_id, i.snapshot_at]
-        );
-
-        extraReceived = rows.reduce((acc, r) => acc + (r.delta || 0), 0);
-        restockCount = rows.length;
-      }
-
-      const totalReceived = base + extraReceived;
-      const pct =
-        totalReceived > 0 ? (sold / totalReceived) * 100 : 0;
-
-      results.push({
-        product_title: i.product_title,
-        variant_title: i.variant_title,
-        image: i.image,
-        initial_base: base,          // stock snapshot
-        extra_received: extraReceived, // total réassorts
-        initial_total: totalReceived,  // stock saison = base + réassorts
-        restock_count: restockCount,   // nombre de réassorts
-        sold,
-        sell_through_pct: Number(pct.toFixed(1)),
+    if (!initialRows.length) {
+      return res.json({
+        products: [],
+        topBest10: [],
+        topWorst10: [],
       });
     }
 
-    // 🔤 Tri alphabétique par nom du produit
-    results.sort((a, b) => a.product_title.localeCompare(b.product_title));
+    // 2. Récupérer les ventes agrégées par variante
+    const salesRows = await db.all(
+      `SELECT variant_id, SUM(qty) AS sold FROM sales GROUP BY variant_id`
+    );
+    const soldMap = new Map(
+      salesRows.map((s) => [String(s.variant_id), s.sold || 0])
+    );
 
-    res.json(results);
-  } catch (e) {
-    console.error("❌ sellthrough error", e);
+    // 3. Récupérer les infos produits depuis Shopify
+    const productsData = await shopifyGet("products.json", { limit: 250 });
+    const products = productsData.products || productsData || [];
+
+    const variantToProduct = new Map();
+
+    for (const p of products) {
+      const productTags = (p.tags || "")
+        .split(",")
+        .map((t) => t.trim().toLowerCase())
+        .filter(Boolean);
+
+      // Filtre par balises : le produit doit contenir TOUTES les balises demandées
+      const matchTags =
+        !tagList.length ||
+        tagList.every((wanted) => productTags.includes(wanted));
+
+      if (!matchTags) continue;
+
+      for (const v of p.variants) {
+        variantToProduct.set(String(v.id), {
+          product_id: p.id,
+          product_title: p.title,
+          product_handle: p.handle,
+          product_type: p.product_type || null,
+          product_tags: p.tags || "",
+          image_src: p.image?.src || null,
+          variant_title: v.title || null,
+          sku: v.sku || null,
+        });
+      }
+    }
+
+    // 4. Agrégation par produit
+    const productMap = new Map();
+
+    for (const row of initialRows) {
+      const meta = variantToProduct.get(String(row.variant_id));
+      if (!meta) continue; // variante non présente ou filtrée par balise
+
+      const sold = soldMap.get(String(row.variant_id)) || 0;
+      const productKey = meta.product_id;
+
+      if (!productMap.has(productKey)) {
+        productMap.set(productKey, {
+          product_id: meta.product_id,
+          title: meta.product_title,
+          handle: meta.product_handle,
+          product_type: meta.product_type,
+          tags: meta.product_tags,
+          image_src: meta.image_src,
+          initial: 0,
+          sold: 0,
+          variants: [],
+        });
+      }
+
+      const agg = productMap.get(productKey);
+
+      agg.initial += row.initial_qty || 0;
+      agg.sold += sold;
+
+      const variantInitial = row.initial_qty || 0;
+      const variantSold = sold;
+      const variantRate =
+        variantInitial > 0
+          ? Number(((variantSold / variantInitial) * 100).toFixed(1))
+          : null;
+
+      agg.variants.push({
+        variant_id: row.variant_id,
+        sku: row.sku,
+        title: meta.variant_title,
+        initial: variantInitial,
+        sold: variantSold,
+        sell_through_pct: variantRate,
+      });
+    }
+
+    // 5. Finaliser les produits (taux de sortie global par produit)
+    let aggregated = Array.from(productMap.values()).map((p) => {
+      const rate =
+        p.initial > 0
+          ? Number(((p.sold / p.initial) * 100).toFixed(1))
+          : null;
+      return {
+        ...p,
+        sell_through_pct: rate,
+      };
+    });
+
+    // 6. Top 10 meilleures sorties (plus haut taux de sortie)
+    const topBest10 = [...aggregated]
+      .filter((p) => p.sell_through_pct !== null)
+      .sort(
+        (a, b) =>
+          (b.sell_through_pct ?? 0) - (a.sell_through_pct ?? 0)
+      )
+      .slice(0, 10);
+
+    // 7. Top 10 pires sorties (taux le plus FAIBLE)
+    const topWorst10 = [...aggregated]
+      .filter((p) => p.sell_through_pct !== null)
+      .sort(
+        (a, b) =>
+          (a.sell_through_pct ?? 0) - (b.sell_through_pct ?? 0)
+      )
+      .slice(0, 10);
+
+    res.json({
+      products: aggregated,
+      topBest10,
+      topWorst10,
+    });
+  } catch (err) {
+    console.error("❌ sellthrough error", err);
     res.status(500).json({ error: "sellthrough failed" });
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/* 🚀 Start server                                                            */
-/* -------------------------------------------------------------------------- */
-
+// ----------------------------
+// Lancement du serveur
+// ----------------------------
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log(`🚀 TAUX DE SORTIE démarré sur port ${PORT}`);
+  console.log(`🚀 App TAUX DE SORTIE démarrée sur port ${PORT}`);
 });
+
