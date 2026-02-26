@@ -601,8 +601,8 @@
     }
 
     async function doSnapshot() {
-      const season = seasonInput.value.trim();
-      if (!season) {
+      const tags = seasonInput.value.trim();  // ✅ on considère l'input comme tags
+      if (!tags) {
         alert("Merci de saisir au moins une balise / saison (ex: ADIDAS, HOMME).");
         return;
       }
@@ -615,7 +615,7 @@
         const res = await fetch("/api/initial_stock/snapshot", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ season }),
+          body: JSON.stringify({ tags }),   // ✅ IMPORTANT
         });
 
         const json = await res.json();
@@ -625,7 +625,7 @@
         } else {
           setStatus(
             "✅ Stock de départ mis à jour pour " +
-              season +
+              tags +
               " (" +
               json.inserted +
               " variantes)."
@@ -642,8 +642,8 @@
     }
 
     async function refresh() {
-      const season = seasonInput.value.trim();
-      if (!season) {
+      const tags = seasonInput.value.trim();
+      if (!tags) {
         setStatus("Saisis une saison / balises puis clique sur Snapshot.");
         return;
       }
@@ -651,12 +651,10 @@
       setStatus("🔄 Chargement des données…");
 
       try {
-        // on envoie season à la fois comme saison (pour la DB) et comme tags (pour le filtre produits Shopify)
+        // ✅ on interroge uniquement par tags (le backend sait gérer)
         const url =
-          "/api/sellthrough?season=" +
-          encodeURIComponent(season) +
-          "&tags=" +
-          encodeURIComponent(season);
+          "/api/sellthrough?tags=" +
+          encodeURIComponent(tags);
 
         const res = await fetch(url);
         const data = await res.json();
