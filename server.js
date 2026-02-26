@@ -1,11 +1,10 @@
-// server.js – TAUX DE SORTIE (version complète avec Top 10 best + worst)
-
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import https from "https";
 import { initDb, db } from "./db.js";
 
 dotenv.config();
@@ -15,146 +14,229 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
+// =====================
+// ENV
+// =====================
 const SHOP_NAME = process.env.SHOP_NAME; // ex: vitamine-clubfr.myshopify.com
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
 const API_VERSION = process.env.API_VERSION || "2024-10";
 
 if (!SHOP_NAME || !ADMIN_API_TOKEN) {
-  console.warn("⚠️ SHOP_NAME ou ADMIN_API_TOKEN non définis dans l'environnement.");
+  console.warn("⚠️ SHOP_NAME ou ADMIN_API_TOKEN non définis dans les variables d'environnement (Render).");
 }
 
-// ----------------------------
-// Utilitaire Shopify REST
-// ----------------------------
-async function shopifyGet(pathUrl, params = {}) {
-  const url = `https://${SHOP_NAME}/admin/api/${API_VERSION}/${pathUrl}`;
-  console.log("➡️ Appel Shopify :", url);
-  const res = await axios.get(url, {
-    headers: {
-      "X-Shopify-Access-Token": ADMIN_API_TOKEN,
-      "Content-Type": "application/json",
-    },
-    params,
-  });
-  return res.data;
-}
+// =====================
+// Axios + keep-alive
+// =====================
+const httpsAgent = new https.Agent({ keepAlive: true });
 
-// ----------------------------
-// PAGE FRONT (Dashboard)
-// ----------------------------
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+const http = axios.create({
+  httpsAgent,
+  timeout: 30000,
+  headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
 });
 
-// ----------------------------
-// 1) Snapshot du stock de départ
-// ----------------------------
-//
-// On prend un "instantané" des stocks actuels par variante
-// et on les enregistre dans la table initial_stock pour une saison donnée.
-//
+// =====================
+// Helpers
+// =====================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function normalizeTag(t) {
+  return String(t || "")
+    .trim()
+    .toLowerCase();
+}
+
+// L’utilisateur met "adidas" ou "adidas, fw25" ou "adidas + fw25"
+function parseTagsInput(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return [];
+  return raw
+    .split(/[,;+]/g)
+    .map((s) => normalizeTag(s))
+    .filter(Boolean);
+}
+
+function productHasAllTags(product, requiredTags) {
+  if (!requiredTags.length) return true;
+  const tags = (product.tags || "")
+    .split(",")
+    .map((t) => normalizeTag(t));
+  return requiredTags.every((rt) => tags.includes(rt));
+}
+
+/**
+ * Shopify GET avec retry automatique sur 429 (Retry-After)
+ */
+async function shopifyGet(pathUrl, params = {}, attempt = 0) {
+  const url = `https://${SHOP_NAME}/admin/api/${API_VERSION}/${pathUrl}`;
+
+  try {
+    // Petit log utile (sans token)
+    console.log(`➡️ Appel Shopify : ${url}`);
+
+    const res = await http.get(url, { params });
+    return res.data;
+  } catch (err) {
+    const status = err?.response?.status;
+
+    if (status === 429 && attempt < 8) {
+      const retryAfterSec = Number(err.response.headers["retry-after"] || 2);
+      const waitMs = Math.max(1000, retryAfterSec * 1000);
+      console.warn(`⏳ 429 Shopify (rate limit). Retry dans ${waitMs}ms (attempt ${attempt + 1}/8)`);
+      await sleep(waitMs);
+      return shopifyGet(pathUrl, params, attempt + 1);
+    }
+
+    throw err;
+  }
+}
+
+/**
+ * Récupère tous les produits (pagination since_id)
+ * Attention : REST ne filtre pas par tags → on filtre côté code
+ */
+async function fetchAllProducts() {
+  const all = [];
+  let since_id = 0;
+
+  while (true) {
+    // On garde la payload raisonnable
+    const data = await shopifyGet("products.json", {
+      limit: 250,
+      since_id,
+      fields: "id,title,handle,tags,image,variants",
+    });
+
+    const batch = data?.products || [];
+    if (!batch.length) break;
+
+    all.push(...batch);
+    since_id = batch[batch.length - 1].id;
+
+    // petite pause pour rester cool
+    await sleep(350);
+  }
+
+  return all;
+}
+
+/**
+ * inventory_levels en batch (ex: 50 inventory_item_ids par appel)
+ * Retourne Map(inventory_item_id -> qty totale)
+ */
+async function fetchInventoryLevelsByInventoryItemIds(inventoryItemIds) {
+  const map = new Map();
+  const ids = Array.from(new Set(inventoryItemIds.filter(Boolean)));
+
+  const CHUNK = 50;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+
+    const data = await shopifyGet("inventory_levels.json", {
+      inventory_item_ids: chunk.join(","),
+    });
+
+    const levels = data?.inventory_levels || [];
+    for (const lvl of levels) {
+      const key = String(lvl.inventory_item_id);
+      const prev = map.get(key) || 0;
+      map.set(key, prev + (lvl.available || 0));
+    }
+
+    // cadence douce pour éviter les 429
+    await sleep(350);
+  }
+
+  return map;
+}
+
+// =====================
+// API
+// =====================
+
+/**
+ * Snapshot stock de départ basé sur balise(s)
+ * Body: { season: "adidas" } ou { season: "adidas, fw25" }
+ */
 app.post("/api/initial_stock/snapshot", async (req, res) => {
   try {
     const { season } = req.body;
-    if (!season) {
-      return res.status(400).json({ error: "season required" });
+    if (!season) return res.status(400).json({ error: "season required" });
+
+    const requiredTags = parseTagsInput(season);
+
+    // 1) produits
+    const products = await fetchAllProducts();
+
+    // 2) filtre tags
+    const selected = requiredTags.length
+      ? products.filter((p) => productHasAllTags(p, requiredTags))
+      : products;
+
+    if (!selected.length) {
+      return res.status(200).json({ success: true, inserted: 0, message: "Aucun produit trouvé pour ces balises." });
     }
 
-    // 1. Récupérer les produits (limite 250 pour rester simple)
-    const productsData = await shopifyGet("products.json", { limit: 250 });
-    const products = productsData.products || productsData || [];
-
-    const rowsToInsert = [];
-
-    // 2. Pour chaque variante, on récupère son stock via inventory_levels
-    for (const p of products) {
-      for (const v of p.variants) {
-        const invData = await shopifyGet("inventory_levels.json", {
-          inventory_item_ids: v.inventory_item_id,
-        });
-
-        let qty = 0;
-        if (
-          invData &&
-          invData.inventory_levels &&
-          Array.isArray(invData.inventory_levels)
-        ) {
-          for (const lvl of invData.inventory_levels) {
-            qty += lvl.available || 0;
-          }
-        }
-
-        rowsToInsert.push({
-          variant_id: v.id,
-          sku: v.sku || null,
-          initial_qty: qty,
-          season,
+    // 3) récupère tous les inventory_item_id des variantes
+    const allVariants = [];
+    for (const p of selected) {
+      for (const v of p.variants || []) {
+        allVariants.push({
           product_id: p.id,
           product_title: p.title,
-          product_handle: p.handle,
-          product_type: p.product_type || null,
-          product_tags: p.tags || "",
-          image_src: p.image?.src || null,
-          variant_title: v.title || null,
+          product_image: p.image?.src || null,
+          variant_id: v.id,
+          variant_title: v.title,
+          sku: v.sku || null,
+          inventory_item_id: v.inventory_item_id,
         });
       }
     }
 
-    // 3. Enregistrer dans SQLite
-    const insertPromises = rowsToInsert.map((r) =>
-      db.run(
-        `
-        REPLACE INTO initial_stock (
-          variant_id,
-          sku,
-          initial_qty,
-          season,
-          snapshot_at,
-          product_id,
-          product_title,
-          product_handle,
-          product_type,
-          product_tags,
-          image_src,
-          variant_title
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
+    const inventoryItemIds = allVariants.map((x) => x.inventory_item_id);
+    const invMap = await fetchInventoryLevelsByInventoryItemIds(inventoryItemIds);
+
+    // 4) écrit en DB (1 ligne par variante)
+    const now = new Date().toISOString();
+
+    const insertPromises = allVariants.map((x) => {
+      const qty = invMap.get(String(x.inventory_item_id)) || 0;
+
+      return db.run(
+        `REPLACE INTO initial_stock
+          (variant_id, sku, initial_qty, season, snapshot_at, product_id, product_title, product_image, variant_title)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          r.variant_id,
-          r.sku,
-          r.initial_qty,
-          r.season,
-          new Date().toISOString(),
-          r.product_id,
-          r.product_title,
-          r.product_handle,
-          r.product_type,
-          r.product_tags,
-          r.image_src,
-          r.variant_title,
+          x.variant_id,
+          x.sku,
+          qty,
+          season, // on stocke exactement ce que tu as tapé (ex: "adidas, fw25")
+          now,
+          x.product_id,
+          x.product_title,
+          x.product_image,
+          x.variant_title,
         ]
-      )
-    );
+      );
+    });
 
     await Promise.all(insertPromises);
 
-    res.json({
-      success: true,
-      inserted: rowsToInsert.length,
-    });
-  } catch (err) {
-    console.error("❌ snapshot error", err);
+    res.json({ success: true, inserted: allVariants.length });
+  } catch (e) {
+    console.error("❌ snapshot error", e?.response?.data || e);
     res.status(500).json({ error: "snapshot failed" });
   }
 });
 
-// ----------------------------
-// 2) Webhook Orders (ventes)
-// ----------------------------
+/**
+ * Webhook orders/create
+ * (si tu utilises ça, garde. Sinon pas grave.)
+ */
 app.post("/webhooks/orders_create", async (req, res) => {
   try {
     const order = req.body;
@@ -176,187 +258,142 @@ app.post("/webhooks/orders_create", async (req, res) => {
         )
       );
     }
-
     await Promise.all(ops);
     res.json({ success: true });
-  } catch (err) {
-    console.error("❌ order webhook error", err);
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "webhook failed" });
   }
 });
 
-// ----------------------------
-// 3) Sell-through (taux de sortie)
-// ----------------------------
-//
-// Retourne :
-//  - products : tableau des produits agrégés (regroupe toutes les variantes)
-//  - topBest10 : top 10 meilleures sorties
-//  - topWorst10 : top 10 pires sorties
-//
+/**
+ * SELLTHROUGH regroupé par PRODUIT (1 ligne = 1 produit)
+ * Query: /api/sellthrough?season=adidas,fw25
+ */
 app.get("/api/sellthrough", async (req, res) => {
   try {
-    const { season, tags } = req.query;
+    const { season } = req.query;
+    if (!season) return res.status(400).json({ error: "season param required" });
 
-    if (!season) {
-      return res.status(400).json({ error: "season param required" });
-    }
-
-    // Liste des balises à filtrer (séparées par virgule)
-    const tagList =
-      tags
-        ?.split(",")
-        .map((t) => t.trim().toLowerCase())
-        .filter(Boolean) || [];
-
-    // 1. Récupérer le stock de départ pour la saison
-    const initialRows = await db.all(
+    // Récupère snapshot
+    const initial = await db.all(
       `SELECT * FROM initial_stock WHERE season = ?`,
       [season]
     );
 
-    if (!initialRows.length) {
-      return res.json({
-        products: [],
-        topBest10: [],
-        topWorst10: [],
-      });
-    }
-
-    // 2. Récupérer les ventes agrégées par variante
-    const salesRows = await db.all(
-      `SELECT variant_id, SUM(qty) AS sold FROM sales GROUP BY variant_id`
+    // Récupère ventes
+    const sales = await db.all(
+      `SELECT variant_id, SUM(qty) as sold
+       FROM sales
+       GROUP BY variant_id`
     );
-    const soldMap = new Map(
-      salesRows.map((s) => [String(s.variant_id), s.sold || 0])
-    );
+    const soldMap = new Map(sales.map((s) => [String(s.variant_id), Number(s.sold || 0)]));
 
-    // 3. Récupérer les infos produits depuis Shopify
-    const productsData = await shopifyGet("products.json", { limit: 250 });
-    const products = productsData.products || productsData || [];
-
-    const variantToProduct = new Map();
-
-    for (const p of products) {
-      const productTags = (p.tags || "")
-        .split(",")
-        .map((t) => t.trim().toLowerCase())
-        .filter(Boolean);
-
-      // Filtre par balises : le produit doit contenir TOUTES les balises demandées
-      const matchTags =
-        !tagList.length ||
-        tagList.every((wanted) => productTags.includes(wanted));
-
-      if (!matchTags) continue;
-
-      for (const v of p.variants) {
-        variantToProduct.set(String(v.id), {
-          product_id: p.id,
-          product_title: p.title,
-          product_handle: p.handle,
-          product_type: p.product_type || null,
-          product_tags: p.tags || "",
-          image_src: p.image?.src || null,
-          variant_title: v.title || null,
-          sku: v.sku || null,
-        });
-      }
-    }
-
-    // 4. Agrégation par produit
+    // Regroupe par produit
     const productMap = new Map();
 
-    for (const row of initialRows) {
-      const meta = variantToProduct.get(String(row.variant_id));
-      if (!meta) continue; // variante non présente ou filtrée par balise
-
+    for (const row of initial) {
       const sold = soldMap.get(String(row.variant_id)) || 0;
-      const productKey = meta.product_id;
 
-      if (!productMap.has(productKey)) {
-        productMap.set(productKey, {
-          product_id: meta.product_id,
-          title: meta.product_title,
-          handle: meta.product_handle,
-          product_type: meta.product_type,
-          tags: meta.product_tags,
-          image_src: meta.image_src,
-          initial: 0,
+      const pid = String(row.product_id || "unknown");
+      if (!productMap.has(pid)) {
+        productMap.set(pid, {
+          product_id: row.product_id,
+          product_title: row.product_title || "(sans titre)",
+          product_image: row.product_image || null,
+          stock_initial: 0,
           sold: 0,
+          rate: null,
           variants: [],
         });
       }
 
-      const agg = productMap.get(productKey);
+      const p = productMap.get(pid);
+      p.stock_initial += Number(row.initial_qty || 0);
+      p.sold += Number(sold || 0);
 
-      agg.initial += row.initial_qty || 0;
-      agg.sold += sold;
-
-      const variantInitial = row.initial_qty || 0;
-      const variantSold = sold;
-      const variantRate =
-        variantInitial > 0
-          ? Number(((variantSold / variantInitial) * 100).toFixed(1))
-          : null;
-
-      agg.variants.push({
+      p.variants.push({
         variant_id: row.variant_id,
-        sku: row.sku,
-        title: meta.variant_title,
-        initial: variantInitial,
-        sold: variantSold,
-        sell_through_pct: variantRate,
+        variant_title: row.variant_title || null,
+        sku: row.sku || null,
+        stock_initial: Number(row.initial_qty || 0),
+        sold: Number(sold || 0),
+        rate: row.initial_qty ? Number(((sold / row.initial_qty) * 100).toFixed(1)) : null,
       });
     }
 
-    // 5. Finaliser les produits (taux de sortie global par produit)
-    let aggregated = Array.from(productMap.values()).map((p) => {
-      const rate =
-        p.initial > 0
-          ? Number(((p.sold / p.initial) * 100).toFixed(1))
-          : null;
+    const results = Array.from(productMap.values()).map((p) => {
+      const rate = p.stock_initial ? (p.sold / p.stock_initial) * 100 : null;
       return {
         ...p,
-        sell_through_pct: rate,
+        rate: rate == null ? null : Number(rate.toFixed(1)),
+        variants_count: p.variants.length,
       };
     });
 
-    // 6. Top 10 meilleures sorties (plus haut taux de sortie)
-    const topBest10 = [...aggregated]
-      .filter((p) => p.sell_through_pct !== null)
-      .sort(
-        (a, b) =>
-          (b.sell_through_pct ?? 0) - (a.sell_through_pct ?? 0)
-      )
-      .slice(0, 10);
+    // Tri alphabétique par titre
+    results.sort((a, b) => String(a.product_title).localeCompare(String(b.product_title), "fr", { sensitivity: "base" }));
 
-    // 7. Top 10 pires sorties (taux le plus FAIBLE)
-    const topWorst10 = [...aggregated]
-      .filter((p) => p.sell_through_pct !== null)
-      .sort(
-        (a, b) =>
-          (a.sell_through_pct ?? 0) - (b.sell_through_pct ?? 0)
-      )
-      .slice(0, 10);
-
-    res.json({
-      products: aggregated,
-      topBest10,
-      topWorst10,
-    });
-  } catch (err) {
-    console.error("❌ sellthrough error", err);
+    res.json(results);
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "sellthrough failed" });
   }
 });
 
-// ----------------------------
-// Lancement du serveur
-// ----------------------------
-const PORT = process.env.PORT || 3000;
+/**
+ * TOP 10 meilleures + pires sorties (sur la sélection season)
+ * GET /api/top10?season=adidas
+ */
+app.get("/api/top10", async (req, res) => {
+  try {
+    const { season } = req.query;
+    if (!season) return res.status(400).json({ error: "season param required" });
 
-app.listen(PORT, () => {
-  console.log(`🚀 App TAUX DE SORTIE démarrée sur port ${PORT}`);
+    // On réutilise l’API sellthrough (logique identique)
+    const initial = await db.all(`SELECT * FROM initial_stock WHERE season = ?`, [season]);
+    const sales = await db.all(`SELECT variant_id, SUM(qty) as sold FROM sales GROUP BY variant_id`);
+    const soldMap = new Map(sales.map((s) => [String(s.variant_id), Number(s.sold || 0)]));
+
+    const productMap = new Map();
+    for (const row of initial) {
+      const sold = soldMap.get(String(row.variant_id)) || 0;
+      const pid = String(row.product_id || "unknown");
+
+      if (!productMap.has(pid)) {
+        productMap.set(pid, {
+          product_id: row.product_id,
+          product_title: row.product_title || "(sans titre)",
+          product_image: row.product_image || null,
+          stock_initial: 0,
+          sold: 0,
+        });
+      }
+      const p = productMap.get(pid);
+      p.stock_initial += Number(row.initial_qty || 0);
+      p.sold += Number(sold || 0);
+    }
+
+    const arr = Array.from(productMap.values()).map((p) => ({
+      ...p,
+      rate: p.stock_initial ? Number(((p.sold / p.stock_initial) * 100).toFixed(1)) : 0,
+    }));
+
+    // Meilleurs: taux DESC
+    const best = [...arr].sort((a, b) => b.rate - a.rate).slice(0, 10);
+
+    // Pires: taux ASC
+    const worst = [...arr].sort((a, b) => a.rate - b.rate).slice(0, 10);
+
+    res.json({ best, worst });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "top10 failed" });
+  }
 });
 
+// =====================
+// Start
+// =====================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ App TAUX DE SORTIE démarrée sur port ${PORT}`));
