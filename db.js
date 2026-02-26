@@ -1,133 +1,113 @@
-// db.js
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
-
-// Chemin du fichier SQLite (dans Render, il sera créé dans le dossier du projet)
-const DB_FILE = process.env.DB_FILE || "./data.sqlite";
 
 export let db;
 
 /**
- * Ajoute une colonne si elle n'existe pas (migration "safe")
- */
-async function ensureColumn(table, column, type) {
-  const cols = await db.all(`PRAGMA table_info(${table})`);
-  const exists = cols.some((c) => c.name === column);
-  if (!exists) {
-    console.log(`🛠️ Migration: ajout colonne ${table}.${column} (${type})`);
-    await db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-  }
-}
-
-/**
- * Crée tables + applique les migrations si besoin
+ * Initialise la DB SQLite et crée / met à jour les tables
  */
 export async function initDb() {
   db = await open({
-    filename: DB_FILE,
+    filename: "./data.sqlite",
     driver: sqlite3.Database,
   });
 
-  // Meilleure robustesse SQLite
-  await db.run("PRAGMA journal_mode = WAL;");
-  await db.run("PRAGMA foreign_keys = ON;");
+  // --- Tables principales ---
+  await db.exec(`
+    PRAGMA journal_mode = WAL;
 
-  // -------------------------
-  // TABLE: initial_stock
-  // 1 ligne = 1 variante snapshotée (stock initial pour une saison/balise)
-  // -------------------------
-  await db.run(`
     CREATE TABLE IF NOT EXISTS initial_stock (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      season TEXT,
-      variant_id INTEGER,
+
+      -- Identité produit + variante (Shopify)
+      product_id INTEGER,
+      product_title TEXT,
+      product_image TEXT,
+
+      variant_id INTEGER UNIQUE,
+      variant_title TEXT,
       sku TEXT,
+
+      -- Stock initial pour la sélection (tags)
       initial_qty INTEGER DEFAULT 0,
+
+      -- Tags utilisés lors du snapshot (ex: "adidas" ou "adidas,nike")
+      tags TEXT,
+
       snapshot_at TEXT
-      -- colonnes ajoutées via migration (ci-dessous) si DB ancienne
-    )
-  `);
+    );
 
-  // Index utiles
-  await db.run(
-    `CREATE INDEX IF NOT EXISTS idx_initial_stock_season ON initial_stock(season)`
-  );
-  await db.run(
-    `CREATE INDEX IF NOT EXISTS idx_initial_stock_variant ON initial_stock(variant_id)`
-  );
-
-  // -------------------------
-  // TABLE: sales
-  // ventes (webhook orders/create)
-  // -------------------------
-  await db.run(`
     CREATE TABLE IF NOT EXISTS sales (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      season TEXT,
-      product_id INTEGER,
       variant_id INTEGER,
       sku TEXT,
       qty INTEGER DEFAULT 0,
-      order_id TEXT,
+      order_id INTEGER,
       created_at TEXT
-    )
-  `);
-  await db.run(
-    `CREATE INDEX IF NOT EXISTS idx_sales_variant ON sales(variant_id)`
-  );
-  await db.run(
-    `CREATE INDEX IF NOT EXISTS idx_sales_season ON sales(season)`
-  );
-  await db.run(
-    `CREATE INDEX IF NOT EXISTS idx_sales_order ON sales(order_id)`
-  );
+    );
 
-  // -------------------------
-  // TABLE: restocks
-  // réassorts (si tu utilises cette logique)
-  // -------------------------
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS restocks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      season TEXT,
-      product_id INTEGER,
-      variant_id INTEGER,
-      qty INTEGER DEFAULT 0,
-      label TEXT,
-      created_at TEXT
-    )
-  `);
-  await db.run(
-    `CREATE INDEX IF NOT EXISTS idx_restocks_variant ON restocks(variant_id)`
-  );
-  await db.run(
-    `CREATE INDEX IF NOT EXISTS idx_restocks_season ON restocks(season)`
-  );
-
-  // -------------------------
-  // TABLE: inventory_changes
-  // (webhook inventory_levels/update si tu l'utilises)
-  // -------------------------
-  await db.run(`
     CREATE TABLE IF NOT EXISTS inventory_changes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       inventory_item_id INTEGER,
       location_id INTEGER,
       available INTEGER DEFAULT 0,
       recorded_at TEXT
-    )
+    );
   `);
 
-  // ---------------------------------------------------------
-  // MIGRATIONS "SAFE" : ajout des colonnes manquantes
-  // (corrige ton erreur: product_id manquant dans initial_stock)
-  // ---------------------------------------------------------
-  await ensureColumn("initial_stock", "product_id", "INTEGER");
-  await ensureColumn("initial_stock", "product_title", "TEXT");
-  await ensureColumn("initial_stock", "product_image", "TEXT");
-  await ensureColumn("initial_stock", "variant_title", "TEXT");
-  await ensureColumn("initial_stock", "tags", "TEXT");
-  await ensureColumn("initial_stock", "handle", "TEXT");
+  // --- Migrations: si ta table existe déjà, ajoute les colonnes manquantes ---
+  await ensureColumns("initial_stock", [
+    ["product_id", "INTEGER"],
+    ["product_title", "TEXT"],
+    ["product_image", "TEXT"],
+    ["variant_id", "INTEGER"],
+    ["variant_title", "TEXT"],
+    ["sku", "TEXT"],
+    ["initial_qty", "INTEGER DEFAULT 0"],
+    ["tags", "TEXT"],
+    ["snapshot_at", "TEXT"],
+  ]);
 
-  console.log(`✅ DB prête: ${DB_FILE}`);
+  await ensureColumns("sales", [
+    ["variant_id", "INTEGER"],
+    ["sku", "TEXT"],
+    ["qty", "INTEGER DEFAULT 0"],
+    ["order_id", "INTEGER"],
+    ["created_at", "TEXT"],
+  ]);
+
+  await ensureColumns("inventory_changes", [
+    ["inventory_item_id", "INTEGER"],
+    ["location_id", "INTEGER"],
+    ["available", "INTEGER DEFAULT 0"],
+    ["recorded_at", "TEXT"],
+  ]);
+
+  // --- Index utiles (perf) ---
+  await db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_initial_stock_tags ON initial_stock(tags);
+    CREATE INDEX IF NOT EXISTS idx_initial_stock_product_id ON initial_stock(product_id);
+    CREATE INDEX IF NOT EXISTS idx_sales_variant_id ON sales(variant_id);
+  `);
+
+  console.log("✅ SQLite DB ready");
+}
+
+/**
+ * Vérifie si une colonne existe, sinon l'ajoute (migration douce)
+ */
+async function ensureColumns(tableName, columns) {
+  const existing = await db.all(`PRAGMA table_info(${tableName});`);
+  const existingNames = new Set(existing.map((c) => c.name));
+
+  for (const [name, type] of columns) {
+    if (!existingNames.has(name)) {
+      console.log(`➕ Migration: add column ${tableName}.${name}`);
+      await db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${name} ${type};`);
+    }
+  }
+
+  // Cas spécial : variant_id doit être UNIQUE (pour REPLACE)
+  // Si l'ancien schéma n'avait pas UNIQUE, SQLite ne permet pas ALTER facilement.
+  // On ne force pas ici, mais notre CREATE TABLE initial le met déjà en UNIQUE.
 }
