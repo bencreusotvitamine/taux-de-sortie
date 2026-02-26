@@ -4,7 +4,6 @@ import axios from "axios";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
-import https from "https";
 import { initDb, db } from "./db.js";
 
 dotenv.config();
@@ -14,233 +13,336 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(bodyParser.json({ limit: "2mb" }));
+app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// =====================
-// ENV
-// =====================
 const SHOP_NAME = process.env.SHOP_NAME; // ex: vitamine-clubfr.myshopify.com
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
 const API_VERSION = process.env.API_VERSION || "2024-10";
 
 if (!SHOP_NAME || !ADMIN_API_TOKEN) {
-  console.warn("⚠️ SHOP_NAME ou ADMIN_API_TOKEN non définis dans les variables d'environnement (Render).");
+  console.warn("⚠️ SHOP_NAME ou ADMIN_API_TOKEN non définis dans Render/.env");
 }
 
-// =====================
-// Axios + keep-alive
-// =====================
-const httpsAgent = new https.Agent({ keepAlive: true });
-
-const http = axios.create({
-  httpsAgent,
-  timeout: 30000,
-  headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
-});
-
-// =====================
-// Helpers
-// =====================
+// ---------------------------------------------------------
+// Utils
+// ---------------------------------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function normalizeTag(t) {
-  return String(t || "")
+function normalizeTag(s) {
+  return String(s || "")
     .trim()
     .toLowerCase();
 }
 
-// L’utilisateur met "adidas" ou "adidas, fw25" ou "adidas + fw25"
-function parseTagsInput(input) {
-  const raw = String(input || "").trim();
-  if (!raw) return [];
-  return raw
-    .split(/[,;+]/g)
-    .map((s) => normalizeTag(s))
-    .filter(Boolean);
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
-function productHasAllTags(product, requiredTags) {
-  if (!requiredTags.length) return true;
-  const tags = (product.tags || "")
-    .split(",")
-    .map((t) => normalizeTag(t));
-  return requiredTags.every((rt) => tags.includes(rt));
-}
-
-/**
- * Shopify GET avec retry automatique sur 429 (Retry-After)
- */
-async function shopifyGet(pathUrl, params = {}, attempt = 0) {
-  const url = `https://${SHOP_NAME}/admin/api/${API_VERSION}/${pathUrl}`;
-
-  try {
-    // Petit log utile (sans token)
-    console.log(`➡️ Appel Shopify : ${url}`);
-
-    const res = await http.get(url, { params });
-    return res.data;
-  } catch (err) {
-    const status = err?.response?.status;
-
-    if (status === 429 && attempt < 8) {
-      const retryAfterSec = Number(err.response.headers["retry-after"] || 2);
-      const waitMs = Math.max(1000, retryAfterSec * 1000);
-      console.warn(`⏳ 429 Shopify (rate limit). Retry dans ${waitMs}ms (attempt ${attempt + 1}/8)`);
-      await sleep(waitMs);
-      return shopifyGet(pathUrl, params, attempt + 1);
+function parseNextPageUrl(linkHeader) {
+  // Shopify REST pagination: Link: <...page_info=xxx>; rel="next", <...>; rel="previous"
+  if (!linkHeader) return null;
+  const parts = linkHeader.split(",");
+  for (const p of parts) {
+    const seg = p.trim();
+    if (seg.includes('rel="next"')) {
+      const m = seg.match(/<([^>]+)>/);
+      if (m && m[1]) return m[1];
     }
+  }
+  return null;
+}
 
-    throw err;
+// ---------------------------------------------------------
+// Shopify caller with 429 retry
+// ---------------------------------------------------------
+async function shopifyGetAbsolute(url, params = {}) {
+  while (true) {
+    try {
+      console.log(`➡️ Appel Shopify : ${url}`);
+      const res = await axios.get(url, {
+        headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN },
+        params,
+        validateStatus: (s) => s >= 200 && s < 500,
+      });
+
+      if (res.status === 429) {
+        const retryAfter = Number(res.headers["retry-after"] || 2);
+        console.warn(`⚠️ 429 Too Many Requests. Retry after ${retryAfter}s`);
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+
+      if (res.status >= 400) {
+        throw new Error(
+          `Shopify error ${res.status}: ${JSON.stringify(res.data)}`
+        );
+      }
+
+      return { data: res.data, headers: res.headers };
+    } catch (e) {
+      // retry network errors a little
+      const msg = String(e?.message || e);
+      console.error("❌ Shopify call failed:", msg);
+      throw e;
+    }
   }
 }
 
-/**
- * Récupère tous les produits (pagination since_id)
- * Attention : REST ne filtre pas par tags → on filtre côté code
- */
+function shopifyUrl(pathUrl) {
+  return `https://${SHOP_NAME}/admin/api/${API_VERSION}/${pathUrl}`;
+}
+
+// ---------------------------------------------------------
+// Fetch all products by pagination
+// ---------------------------------------------------------
 async function fetchAllProducts() {
+  // Important: fields limit what we download (faster)
+  let url = shopifyUrl("products.json");
+  const params = {
+    limit: 250,
+    fields: "id,title,handle,tags,image,images,variants",
+  };
+
   const all = [];
-  let since_id = 0;
+  while (url) {
+    const { data, headers } = await shopifyGetAbsolute(url, params);
+    if (data?.products?.length) all.push(...data.products);
 
-  while (true) {
-    // On garde la payload raisonnable
-    const data = await shopifyGet("products.json", {
-      limit: 250,
-      since_id,
-      fields: "id,title,handle,tags,image,variants",
-    });
+    const nextUrl = parseNextPageUrl(headers.link);
+    url = nextUrl || null;
 
-    const batch = data?.products || [];
-    if (!batch.length) break;
-
-    all.push(...batch);
-    since_id = batch[batch.length - 1].id;
-
-    // petite pause pour rester cool
-    await sleep(350);
+    // For next pages, Shopify wants NO params except what’s already in nextUrl
+    // So we clear params after first call
+    params.limit = undefined;
+    params.fields = undefined;
   }
-
   return all;
 }
 
-/**
- * inventory_levels en batch (ex: 50 inventory_item_ids par appel)
- * Retourne Map(inventory_item_id -> qty totale)
- */
-async function fetchInventoryLevelsByInventoryItemIds(inventoryItemIds) {
-  const map = new Map();
-  const ids = Array.from(new Set(inventoryItemIds.filter(Boolean)));
+// ---------------------------------------------------------
+// Batch inventory levels for many inventory_item_ids
+// ---------------------------------------------------------
+async function fetchInventoryLevelsSum(inventoryItemIds) {
+  // Shopify supports comma-separated inventory_item_ids
+  // We'll batch by 50 to reduce calls
+  const batches = chunk(inventoryItemIds, 50);
+  const map = new Map(); // inventory_item_id -> total available (sum locations)
 
-  const CHUNK = 50;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const chunk = ids.slice(i, i + CHUNK);
-
-    const data = await shopifyGet("inventory_levels.json", {
-      inventory_item_ids: chunk.join(","),
+  for (const b of batches) {
+    const url = shopifyUrl("inventory_levels.json");
+    const { data } = await shopifyGetAbsolute(url, {
+      inventory_item_ids: b.join(","),
+      limit: 250,
     });
 
     const levels = data?.inventory_levels || [];
     for (const lvl of levels) {
-      const key = String(lvl.inventory_item_id);
-      const prev = map.get(key) || 0;
-      map.set(key, prev + (lvl.available || 0));
+      const id = String(lvl.inventory_item_id);
+      const prev = map.get(id) || 0;
+      map.set(id, prev + (Number(lvl.available) || 0));
     }
 
-    // cadence douce pour éviter les 429
-    await sleep(350);
+    // petite pause pour être safe
+    await sleep(250);
   }
 
   return map;
 }
 
-// =====================
-// API
-// =====================
-
-/**
- * Snapshot stock de départ basé sur balise(s)
- * Body: { season: "adidas" } ou { season: "adidas, fw25" }
- */
+// ---------------------------------------------------------
+// API: snapshot (stock initial) by tag(s)
+// ---------------------------------------------------------
 app.post("/api/initial_stock/snapshot", async (req, res) => {
   try {
-    const { season } = req.body;
-    if (!season) return res.status(400).json({ error: "season required" });
+    const { tags } = req.body;
+    // tags: string "adidas" ou "adidas,nike"
+    const tagList = String(tags || "")
+      .split(",")
+      .map((t) => normalizeTag(t))
+      .filter(Boolean);
 
-    const requiredTags = parseTagsInput(season);
-
-    // 1) produits
-    const products = await fetchAllProducts();
-
-    // 2) filtre tags
-    const selected = requiredTags.length
-      ? products.filter((p) => productHasAllTags(p, requiredTags))
-      : products;
-
-    if (!selected.length) {
-      return res.status(200).json({ success: true, inserted: 0, message: "Aucun produit trouvé pour ces balises." });
+    if (!tagList.length) {
+      return res.status(400).json({ error: "tags required" });
     }
 
-    // 3) récupère tous les inventory_item_id des variantes
-    const allVariants = [];
-    for (const p of selected) {
+    // 1) Fetch all products
+    const products = await fetchAllProducts();
+    console.log(`✅ Shopify products fetched: ${products.length}`);
+
+    // 2) Filter by tags (AND logic)
+    const filtered = products.filter((p) => {
+      const ptags = String(p.tags || "")
+        .split(",")
+        .map((t) => normalizeTag(t));
+
+      return tagList.every((t) => ptags.includes(t));
+    });
+
+    console.log(
+      `✅ Filter tags (${tagList.join(" + ")}): ${filtered.length} products`
+    );
+
+    // If 0, we stop early (so you SEE it)
+    if (!filtered.length) {
+      return res.json({ success: true, inserted: 0, products: 0 });
+    }
+
+    // 3) Collect all inventory_item_ids from variants
+    const inventoryItemIds = [];
+    for (const p of filtered) {
       for (const v of p.variants || []) {
-        allVariants.push({
-          product_id: p.id,
-          product_title: p.title,
-          product_image: p.image?.src || null,
-          variant_id: v.id,
-          variant_title: v.title,
-          sku: v.sku || null,
-          inventory_item_id: v.inventory_item_id,
-        });
+        if (v.inventory_item_id) inventoryItemIds.push(String(v.inventory_item_id));
       }
     }
 
-    const inventoryItemIds = allVariants.map((x) => x.inventory_item_id);
-    const invMap = await fetchInventoryLevelsByInventoryItemIds(inventoryItemIds);
+    // 4) Batch fetch inventory sums
+    const invMap = await fetchInventoryLevelsSum(inventoryItemIds);
 
-    // 4) écrit en DB (1 ligne par variante)
+    // 5) Insert / replace initial stock PER VARIANT
+    // (si toi tu agrèges par produit côté sellthrough, pas grave)
     const now = new Date().toISOString();
 
-    const insertPromises = allVariants.map((x) => {
-      const qty = invMap.get(String(x.inventory_item_id)) || 0;
+    let inserted = 0;
+    for (const p of filtered) {
+      const productId = p.id;
+      const productTitle = p.title || "";
+      const productImage =
+        p.image?.src ||
+        (Array.isArray(p.images) && p.images[0]?.src) ||
+        null;
 
-      return db.run(
-        `REPLACE INTO initial_stock
-          (variant_id, sku, initial_qty, season, snapshot_at, product_id, product_title, product_image, variant_title)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          x.variant_id,
-          x.sku,
-          qty,
-          season, // on stocke exactement ce que tu as tapé (ex: "adidas, fw25")
-          now,
-          x.product_id,
-          x.product_title,
-          x.product_image,
-          x.variant_title,
-        ]
-      );
-    });
+      for (const v of p.variants || []) {
+        const variantId = v.id;
+        const variantTitle = v.title || "";
+        const sku = v.sku || null;
+        const invItemId = String(v.inventory_item_id || "");
+        const qty = invMap.get(invItemId) || 0;
 
-    await Promise.all(insertPromises);
+        await db.run(
+          `REPLACE INTO initial_stock
+           (product_id, product_title, product_image, variant_id, variant_title, sku, initial_qty, tags, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            productId,
+            productTitle,
+            productImage,
+            variantId,
+            variantTitle,
+            sku,
+            qty,
+            tagList.join(","),
+            now,
+          ]
+        );
+        inserted++;
+      }
+    }
 
-    res.json({ success: true, inserted: allVariants.length });
+    console.log(`✅ snapshot inserted rows: ${inserted}`);
+    res.json({ success: true, inserted });
   } catch (e) {
-    console.error("❌ snapshot error", e?.response?.data || e);
+    console.error("❌ snapshot error", e);
     res.status(500).json({ error: "snapshot failed" });
   }
 });
 
-/**
- * Webhook orders/create
- * (si tu utilises ça, garde. Sinon pas grave.)
- */
+// ---------------------------------------------------------
+// API: sellthrough (by tag selection)
+// ---------------------------------------------------------
+app.get("/api/sellthrough", async (req, res) => {
+  try {
+    const tags = String(req.query.tags || "")
+      .split(",")
+      .map((t) => normalizeTag(t))
+      .filter(Boolean);
+
+    if (!tags.length) return res.status(400).json({ error: "tags required" });
+
+    // initial_stock rows for those tags (we stored tags in initial_stock.tags)
+    const initial = await db.all(
+      `SELECT * FROM initial_stock
+       WHERE tags = ?
+      `,
+      [tags.join(",")]
+    );
+
+    // sales grouped by variant_id
+    const sales = await db.all(
+      `SELECT variant_id, SUM(qty) as sold
+       FROM sales
+       GROUP BY variant_id`
+    );
+    const soldMap = new Map(sales.map((s) => [String(s.variant_id), Number(s.sold) || 0]));
+
+    // Aggregate by product
+    const productMap = new Map();
+    for (const row of initial) {
+      const key = String(row.product_id);
+      const sold = soldMap.get(String(row.variant_id)) || 0;
+
+      if (!productMap.has(key)) {
+        productMap.set(key, {
+          product_id: row.product_id,
+          product_title: row.product_title,
+          product_image: row.product_image,
+          variants_count: 0,
+          initial_qty: 0,
+          sold_qty: 0,
+        });
+      }
+      const p = productMap.get(key);
+      p.variants_count += 1;
+      p.initial_qty += Number(row.initial_qty) || 0;
+      p.sold_qty += sold;
+    }
+
+    const results = Array.from(productMap.values())
+      .map((p) => {
+        const rate =
+          p.initial_qty > 0 ? (p.sold_qty / p.initial_qty) * 100 : 0;
+        return {
+          ...p,
+          sell_through_pct: Number(rate.toFixed(1)),
+        };
+      })
+      .sort((a, b) => a.product_title.localeCompare(b.product_title, "fr"));
+
+    // Top 10 best/worst
+    const top10Best = [...results].sort((a, b) => b.sell_through_pct - a.sell_through_pct).slice(0, 10);
+    const top10Worst = [...results].sort((a, b) => a.sell_through_pct - b.sell_through_pct).slice(0, 10);
+
+    // Global
+    const totalInitial = results.reduce((s, x) => s + x.initial_qty, 0);
+    const totalSold = results.reduce((s, x) => s + x.sold_qty, 0);
+    const globalRate = totalInitial > 0 ? (totalSold / totalInitial) * 100 : 0;
+
+    res.json({
+      tags: tags.join(","),
+      totals: {
+        initial: totalInitial,
+        sold: totalSold,
+        sell_through_pct: Number(globalRate.toFixed(1)),
+      },
+      products: results,
+      top10Best,
+      top10Worst,
+    });
+  } catch (e) {
+    console.error("❌ sellthrough error", e);
+    res.status(500).json({ error: "sellthrough failed" });
+  }
+});
+
+// ---------------------------------------------------------
+// Webhooks (unchanged)
+// ---------------------------------------------------------
 app.post("/webhooks/orders_create", async (req, res) => {
   try {
     const order = req.body;
-    if (!order || !order.line_items) return res.status(400).end();
+    if (!order?.line_items) return res.status(400).end();
 
     const ops = [];
     for (const line of order.line_items) {
@@ -266,134 +368,28 @@ app.post("/webhooks/orders_create", async (req, res) => {
   }
 });
 
-/**
- * SELLTHROUGH regroupé par PRODUIT (1 ligne = 1 produit)
- * Query: /api/sellthrough?season=adidas,fw25
- */
-app.get("/api/sellthrough", async (req, res) => {
+app.post("/webhooks/inventory_levels_update", async (req, res) => {
   try {
-    const { season } = req.query;
-    if (!season) return res.status(400).json({ error: "season param required" });
-
-    // Récupère snapshot
-    const initial = await db.all(
-      `SELECT * FROM initial_stock WHERE season = ?`,
-      [season]
+    const payload = req.body;
+    await db.run(
+      `INSERT INTO inventory_changes (inventory_item_id, location_id, available, recorded_at)
+       VALUES (?, ?, ?, ?)`,
+      [
+        payload.inventory_item_id || null,
+        payload.location_id || null,
+        payload.available || 0,
+        new Date().toISOString(),
+      ]
     );
-
-    // Récupère ventes
-    const sales = await db.all(
-      `SELECT variant_id, SUM(qty) as sold
-       FROM sales
-       GROUP BY variant_id`
-    );
-    const soldMap = new Map(sales.map((s) => [String(s.variant_id), Number(s.sold || 0)]));
-
-    // Regroupe par produit
-    const productMap = new Map();
-
-    for (const row of initial) {
-      const sold = soldMap.get(String(row.variant_id)) || 0;
-
-      const pid = String(row.product_id || "unknown");
-      if (!productMap.has(pid)) {
-        productMap.set(pid, {
-          product_id: row.product_id,
-          product_title: row.product_title || "(sans titre)",
-          product_image: row.product_image || null,
-          stock_initial: 0,
-          sold: 0,
-          rate: null,
-          variants: [],
-        });
-      }
-
-      const p = productMap.get(pid);
-      p.stock_initial += Number(row.initial_qty || 0);
-      p.sold += Number(sold || 0);
-
-      p.variants.push({
-        variant_id: row.variant_id,
-        variant_title: row.variant_title || null,
-        sku: row.sku || null,
-        stock_initial: Number(row.initial_qty || 0),
-        sold: Number(sold || 0),
-        rate: row.initial_qty ? Number(((sold / row.initial_qty) * 100).toFixed(1)) : null,
-      });
-    }
-
-    const results = Array.from(productMap.values()).map((p) => {
-      const rate = p.stock_initial ? (p.sold / p.stock_initial) * 100 : null;
-      return {
-        ...p,
-        rate: rate == null ? null : Number(rate.toFixed(1)),
-        variants_count: p.variants.length,
-      };
-    });
-
-    // Tri alphabétique par titre
-    results.sort((a, b) => String(a.product_title).localeCompare(String(b.product_title), "fr", { sensitivity: "base" }));
-
-    res.json(results);
+    res.json({ success: true });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "sellthrough failed" });
+    res.status(500).json({ error: "inventory webhook failed" });
   }
 });
 
-/**
- * TOP 10 meilleures + pires sorties (sur la sélection season)
- * GET /api/top10?season=adidas
- */
-app.get("/api/top10", async (req, res) => {
-  try {
-    const { season } = req.query;
-    if (!season) return res.status(400).json({ error: "season param required" });
-
-    // On réutilise l’API sellthrough (logique identique)
-    const initial = await db.all(`SELECT * FROM initial_stock WHERE season = ?`, [season]);
-    const sales = await db.all(`SELECT variant_id, SUM(qty) as sold FROM sales GROUP BY variant_id`);
-    const soldMap = new Map(sales.map((s) => [String(s.variant_id), Number(s.sold || 0)]));
-
-    const productMap = new Map();
-    for (const row of initial) {
-      const sold = soldMap.get(String(row.variant_id)) || 0;
-      const pid = String(row.product_id || "unknown");
-
-      if (!productMap.has(pid)) {
-        productMap.set(pid, {
-          product_id: row.product_id,
-          product_title: row.product_title || "(sans titre)",
-          product_image: row.product_image || null,
-          stock_initial: 0,
-          sold: 0,
-        });
-      }
-      const p = productMap.get(pid);
-      p.stock_initial += Number(row.initial_qty || 0);
-      p.sold += Number(sold || 0);
-    }
-
-    const arr = Array.from(productMap.values()).map((p) => ({
-      ...p,
-      rate: p.stock_initial ? Number(((p.sold / p.stock_initial) * 100).toFixed(1)) : 0,
-    }));
-
-    // Meilleurs: taux DESC
-    const best = [...arr].sort((a, b) => b.rate - a.rate).slice(0, 10);
-
-    // Pires: taux ASC
-    const worst = [...arr].sort((a, b) => a.rate - b.rate).slice(0, 10);
-
-    res.json({ best, worst });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "top10 failed" });
-  }
-});
-
-// =====================
-// Start
-// =====================
+// ---------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ App TAUX DE SORTIE démarrée sur port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`✅ App TAUX DE SORTIE démarrée sur port ${PORT}`)
+);
